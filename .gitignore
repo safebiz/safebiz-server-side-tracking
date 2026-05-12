@@ -1,0 +1,35 @@
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.zip
+node_modules/
+vendor/
+
+# Local secrets (NU committed)
+.env
+credentials.env
+*-secrets.*
+*-token.*
+
+# OS artifacts
+desktop.ini
+
+# Logs
+*.log
+
+# Sync conflicts (Syncthing)
+*.sync-conflict-*
+.stversions/
+.stignore
+
+# Plugin Update Cache (just in case)
+.transient-cache
