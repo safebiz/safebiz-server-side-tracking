@@ -2,8 +2,8 @@
 /**
  * Plugin Name: SafeBiz Server-Side Tracking
  * Plugin URI: https://github.com/safebiz/safebiz-server-side-tracking
- * Description: Server-side GA4 purchase tracking via Measurement Protocol cu logging, retry si auto-update via GitHub Releases.
- * Version: 1.0.2
+ * Description: Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub.
+ * Version: 1.2.0
  * Author: SafeBiz Solutions
  * Author URI: https://safebiz.ro
  * License: GPL-2.0-or-later
@@ -13,24 +13,31 @@
  * Requires at least: 6.0
  * Text Domain: safebiz-server-side-tracking
  *
- * Trimite purchase events server-side la GA4, independent de browser.
- * Bypass iOS Safari ITP / AdBlock / Netopia redirect / consent client-side.
+ * Trimite purchase events server-side la GA4 + Meta, independent de browser (bypass ITP/AdBlock).
+ * GATE PE CONSIMTAMANT (GDPR): GA4 doar cu analytics=GRANTED; Meta doar cu marketing=GRANTED.
  *
  * Config in wp-config.php:
+ *   // GA4
  *   define('SAFEBIZ_GA4_MEASUREMENT_ID', 'G-XXXXXXXXXX');
  *   define('SAFEBIZ_GA4_API_SECRET', 'xxxxxxxxxxxxxxxxxxxx');
- *   define('SAFEBIZ_GA4_SEND_ITEMS', true);                  // false pentru Art. 9
- *   define('SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT', false);   // true pentru Art. 9 strict opt-in
+ *   define('SAFEBIZ_GA4_SEND_ITEMS', true);
+ *   define('SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT', false);  // true => GA4 doar cu analytics=GRANTED
+ *   // Meta Conversions API (v1.1.0)
+ *   define('SAFEBIZ_META_PIXEL_ID', '222234967057730');
+ *   define('SAFEBIZ_META_CAPI_TOKEN', '<token CAPI dedicat din Events Manager>');
+ *   define('SAFEBIZ_META_GRAPH_VERSION', 'v21.0');           // optional
+ *   define('SAFEBIZ_META_TEST_EVENT_CODE', '');              // gol = live; setat = Test Events
+ *   define('SAFEBIZ_META_CAPI_REQUIRE_EXPLICIT_CONSENT', true); // STRICT default (GDPR)
  *
- * Order meta tracking:
- *   _safebiz_ga4_mp_status         : queued | sent | error | skipped_no_consent
- *   _safebiz_ga4_mp_queued_at      : timestamp marcaj queued
- *   _safebiz_ga4_mp_sent_at        : timestamp marcaj sent (204 response)
- *   _safebiz_ga4_mp_error          : mesaj eroare daca status=error
- *   _safebiz_ga4_refund_sent       : '1' daca refund event trimis
- *   _safebiz_ga4_refund_at         : timestamp refund trimis
- *   _safebiz_consent_state         : array consent snapshot (din checkout)
- *   _ga_client_id                  : _ga cookie snapshot (din checkout)
+ * Order meta:
+ *   _safebiz_consent_state    : { analytics, marketing, ad_user_data, ad_personalization, source, action, timestamp, captured_at }
+ *   _ga_client_id             : _ga cookie snapshot
+ *   _ga_session_id            : GA4 session id (din cookie _ga_<id>) — join sesiune, pastreaza sursa
+ *   _fbp / _fbc               : Meta browser identifiers (capturate la checkout)
+ *   _safebiz_client_ua        : user-agent original
+ *   _safebiz_ga4_mp_status    : queued | sent | error | skipped_no_consent
+ *   _safebiz_meta_capi_status : queued | sent | error | skipped_no_consent | skipped_stale
+ *   _safebiz_meta_capi_*      : queued_at | sent_at | error | fbtrace | event_id
  */
 
 if ( ! defined('ABSPATH') ) exit;
@@ -47,204 +54,303 @@ new SafeBiz_GitHub_Updater([
 // === Config sanity check ===
 add_action('admin_notices', function() {
     if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) {
-        echo '<div class="notice notice-error"><p><strong>SafeBiz Server-Side Tracking:</strong> SAFEBIZ_GA4_MEASUREMENT_ID si SAFEBIZ_GA4_API_SECRET trebuie definite in wp-config.php. Pluginul nu trimite nimic.</p></div>';
+        echo '<div class="notice notice-warning"><p><strong>SafeBiz Server-Side Tracking:</strong> SAFEBIZ_GA4_MEASUREMENT_ID si SAFEBIZ_GA4_API_SECRET nedefinite in wp-config.php — GA4 server-side inactiv.</p></div>';
+    }
+    if ( defined('SAFEBIZ_META_PIXEL_ID') && ! defined('SAFEBIZ_META_CAPI_TOKEN') ) {
+        echo '<div class="notice notice-warning"><p><strong>SafeBiz Server-Side Tracking:</strong> SAFEBIZ_META_PIXEL_ID definit dar SAFEBIZ_META_CAPI_TOKEN lipseste — Meta CAPI inactiv.</p></div>';
     }
 });
 
-// === Capture consent + _ga client_id la checkout ===
-// Salveaza snapshot in order meta din $_COOKIE pentru consistency server-side.
+function safebiz_meta_graph_version() {
+    return defined('SAFEBIZ_META_GRAPH_VERSION') ? SAFEBIZ_META_GRAPH_VERSION : 'v21.0';
+}
+
+/** SHA-256 normalizat pentru Meta Advanced Matching. */
+function safebiz_hash($v) {
+    $v = trim((string) $v);
+    return $v === '' ? '' : hash('sha256', strtolower($v));
+}
+
+/** Normalizare telefon E.164 (RO). */
+function safebiz_norm_phone($p) {
+    $d = preg_replace('/\D+/', '', (string) $p);
+    if ( $d === '' ) return '';
+    if ( strpos($d, '0') === 0 && strlen($d) === 10 ) $d = '4' . $d; // 07xxxxxxxx -> 407...
+    return $d;
+}
+
+// ============================================================
+// CAPTURA la checkout: _ga client_id + consent snapshot + _fbp/_fbc/UA
+// ============================================================
 add_action('woocommerce_checkout_create_order', 'safebiz_capture_tracking_context', 10, 2);
 function safebiz_capture_tracking_context($order, $data) {
-    // _ga cookie => client_id GA4 (format: GA1.2.XXXXXXXXXX.YYYYYYYYYY)
+    // _ga cookie => client_id GA4
     if ( ! empty($_COOKIE['_ga']) ) {
-        $ga_cookie = sanitize_text_field($_COOKIE['_ga']);
-        $parts = explode('.', $ga_cookie);
+        $parts = explode('.', sanitize_text_field(wp_unslash($_COOKIE['_ga'])));
         if ( count($parts) >= 4 ) {
-            $client_id = $parts[2] . '.' . $parts[3];
-            $order->update_meta_data('_ga_client_id', $client_id);
+            $order->update_meta_data('_ga_client_id', $parts[2] . '.' . $parts[3]);
         }
     }
 
-    // Consent snapshot — detectie generica pentru CMP-uri comune.
-    // TODO per CMP: adapta cookie name pentru cazul concret.
+    // _ga_<SUFFIX> cookie => ga_session_id (format: GS1.1.<session_id>.<...>)
+    // FARA session_id, purchase-ul server-side creeaza o sesiune NOUA neatribuita (source=(not set))
+    // -> atribuirea canalelor (newsletter/ads/seo) se pierde. Cu el, purchase-ul se leaga de sesiunea
+    // reala a userului si mosteneste sursa corecta.
+    if ( defined('SAFEBIZ_GA4_MEASUREMENT_ID') ) {
+        $ga_suffix = substr(SAFEBIZ_GA4_MEASUREMENT_ID, 2); // 'G-GJ4YQYXWLE' => 'GJ4YQYXWLE'
+        if ( $ga_suffix && ! empty($_COOKIE['_ga_' . $ga_suffix]) ) {
+            // field[2] = session blob. Doua formate posibile:
+            //   clasic:  GS1.1.1778607197.43.1...        => "1778607197"
+            //   packed:  GS1.1.s1778607197$o43$t...      => "s1778607197$o43$..." (Consent Mode/sGTM)
+            // session_id GA4 = numarul de dupa 's' (sau direct), urmat de '$' (packed) sau sfarsit (clasic).
+            $s_parts = explode('.', sanitize_text_field(wp_unslash($_COOKIE['_ga_' . $ga_suffix])));
+            if ( isset($s_parts[2]) && preg_match('/^s?(\d+)(?:\$|$)/', $s_parts[2], $m) ) {
+                $order->update_meta_data('_ga_session_id', $m[1]);
+            }
+        }
+    }
+
+    // Consent snapshot (cookie primar SureCookie + fallback-uri)
     $consent_state = safebiz_detect_consent_state();
     if ( ! empty($consent_state) ) {
         $order->update_meta_data('_safebiz_consent_state', $consent_state);
     }
+
+    // Meta browser identifiers (pentru match quality + dedup)
+    if ( ! empty($_COOKIE['_fbp']) ) {
+        $order->update_meta_data('_fbp', sanitize_text_field(wp_unslash($_COOKIE['_fbp'])));
+    }
+    $fbc = '';
+    if ( ! empty($_COOKIE['_fbc']) ) {
+        $fbc = sanitize_text_field(wp_unslash($_COOKIE['_fbc']));
+    } elseif ( ! empty($_GET['fbclid']) ) {
+        // construieste _fbc format Meta: fb.1.{timestamp}.{fbclid}
+        $fbc = 'fb.1.' . time() . '.' . sanitize_text_field(wp_unslash($_GET['fbclid']));
+    }
+    if ( $fbc ) $order->update_meta_data('_fbc', $fbc);
+
+    if ( ! empty($_SERVER['HTTP_USER_AGENT']) ) {
+        $order->update_meta_data('_safebiz_client_ua', substr(sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])), 0, 350));
+    }
 }
 
 /**
- * Detectie generica consent state din cookies.
- * Returneaza array cu 'ad_user_data' si 'ad_personalization' (GRANTED/DENIED) sau array gol.
+ * Detectie consent state. Returneaza array cu 'analytics' + 'marketing' (GRANTED/DENIED)
+ * + 'ad_user_data'/'ad_personalization' (din marketing) + metadata. Array gol = necunoscut (=> DENIED la gate).
  *
- * Suporta:
- *   - Moove GDPR Cookie Compliance: cookie 'moove_gdpr_popup' (JSON)
- *   - SureCookie: cookie 'surecookie_consent' (JSON)
- *   - Cookiebot: cookie 'CookieConsent'
- *   - GDPR Cookie Consent (Webtoffee): 'cookielawinfo-checkbox-*'
- *   - Generic: cookie 'cookie_consent' = 'accepted'
+ * Ordine (post-Codex runda 3): cookie SureCookie real PRIMAR; WP Consent API doar guarded (opt-in);
+ * fallback Moove/Cookiebot/Webtoffee. wp_has_consent() necondiționat = periculos (optimistic true).
  */
 function safebiz_detect_consent_state() {
-    $state = [];
+    // PRIMAR: cookie real SureCookie 'surecookie_user_consent' (JSON url-encoded)
+    if ( ! empty($_COOKIE['surecookie_user_consent']) ) {
+        $d = json_decode( urldecode( wp_unslash($_COOKIE['surecookie_user_consent']) ), true );
+        if ( is_array($d) ) {
+            $p = isset($d['preferences']) && is_array($d['preferences']) ? $d['preferences'] : $d;
+            $analytics = ! empty($p['analytics']) || ! empty($p['statistics']);
+            $marketing = ! empty($p['marketing']) || ! empty($p['advertising']);
+            return [
+                'analytics'          => $analytics ? 'GRANTED' : 'DENIED',
+                'marketing'          => $marketing ? 'GRANTED' : 'DENIED',
+                'ad_user_data'       => $marketing ? 'GRANTED' : 'DENIED',
+                'ad_personalization' => $marketing ? 'GRANTED' : 'DENIED',
+                'source'             => 'surecookie_user_consent',
+                'action'             => $d['action'] ?? null,
+                'timestamp'          => $d['timestamp'] ?? null,
+                'captured_at'        => current_time('mysql'),
+            ];
+        }
+    }
 
-    // Moove GDPR Cookie Compliance (folosit pe MPSS)
-    // Cookie: moove_gdpr_popup = JSON {"strict":1,"thirdparty":1,"advanced":1}
+    // SECUNDAR (guarded): WP Consent API DOAR daca e opt-in real
+    if ( function_exists('wp_has_consent') && function_exists('wp_get_consent_type') ) {
+        $ct = wp_get_consent_type();
+        if ( is_string($ct) && strpos($ct, 'optin') !== false ) {
+            $analytics = wp_has_consent('statistics');
+            $marketing = wp_has_consent('marketing');
+            return [
+                'analytics'          => $analytics ? 'GRANTED' : 'DENIED',
+                'marketing'          => $marketing ? 'GRANTED' : 'DENIED',
+                'ad_user_data'       => $marketing ? 'GRANTED' : 'DENIED',
+                'ad_personalization' => $marketing ? 'GRANTED' : 'DENIED',
+                'source'             => 'wp_consent_api_optin',
+                'captured_at'        => current_time('mysql'),
+            ];
+        }
+    }
+
+    // Fallback Moove GDPR (MPSS) — cookie moove_gdpr_popup
     if ( ! empty($_COOKIE['moove_gdpr_popup']) ) {
-        $raw = stripslashes($_COOKIE['moove_gdpr_popup']);
-        $decoded = json_decode($raw, true);
+        $decoded = json_decode( stripslashes(wp_unslash($_COOKIE['moove_gdpr_popup'])), true );
         if ( is_array($decoded) ) {
             $thirdparty = ! empty($decoded['thirdparty']);
             $advanced   = ! empty($decoded['advanced']);
-            // Strict per Codex review 2026-05-12: pentru Art. 9 doar 'thirdparty' (marketing)
-            // contribuie la consent. 'advanced' poate semnifica analytics/functional,
-            // NU justifica ad_personalization=GRANTED pentru adult shop.
-            $state['ad_user_data']       = $thirdparty ? 'GRANTED' : 'DENIED';
-            $state['ad_personalization'] = $thirdparty ? 'GRANTED' : 'DENIED';
-            return $state;
+            return [
+                'analytics'          => $advanced ? 'GRANTED' : 'DENIED',
+                'marketing'          => $thirdparty ? 'GRANTED' : 'DENIED',
+                'ad_user_data'       => $thirdparty ? 'GRANTED' : 'DENIED',
+                'ad_personalization' => $thirdparty ? 'GRANTED' : 'DENIED',
+                'source'             => 'moove_gdpr',
+                'captured_at'        => current_time('mysql'),
+            ];
         }
     }
 
-    // SureCookie
-    if ( ! empty($_COOKIE['surecookie_consent']) ) {
-        $raw = stripslashes($_COOKIE['surecookie_consent']);
-        $decoded = json_decode($raw, true);
-        if ( is_array($decoded) ) {
-            $state['ad_user_data']       = ! empty($decoded['marketing'] ?? $decoded['advertising'] ?? null) ? 'GRANTED' : 'DENIED';
-            $state['ad_personalization'] = ! empty($decoded['personalization'] ?? null) ? 'GRANTED' : 'DENIED';
-            return $state;
-        }
-    }
-
-    // Cookiebot
+    // Fallback Cookiebot
     if ( ! empty($_COOKIE['CookieConsent']) ) {
-        $raw = stripslashes($_COOKIE['CookieConsent']);
-        if ( strpos($raw, 'marketing:true') !== false ) {
-            $state['ad_user_data'] = 'GRANTED';
-        } else {
-            $state['ad_user_data'] = 'DENIED';
-        }
-        $state['ad_personalization'] = (strpos($raw, 'preferences:true') !== false) ? 'GRANTED' : 'DENIED';
-        return $state;
+        $raw = stripslashes(wp_unslash($_COOKIE['CookieConsent']));
+        $marketing = strpos($raw, 'marketing:true') !== false;
+        $analytics = strpos($raw, 'statistics:true') !== false;
+        return [
+            'analytics'          => $analytics ? 'GRANTED' : 'DENIED',
+            'marketing'          => $marketing ? 'GRANTED' : 'DENIED',
+            'ad_user_data'       => $marketing ? 'GRANTED' : 'DENIED',
+            'ad_personalization' => $marketing ? 'GRANTED' : 'DENIED',
+            'source'             => 'cookiebot',
+            'captured_at'        => current_time('mysql'),
+        ];
     }
 
-    // GDPR Cookie Consent (Webtoffee)
+    // Fallback Webtoffee
     if ( ! empty($_COOKIE['cookielawinfo-checkbox-advertisement']) ) {
-        $state['ad_user_data']       = ($_COOKIE['cookielawinfo-checkbox-advertisement'] === 'yes') ? 'GRANTED' : 'DENIED';
-        $state['ad_personalization'] = ! empty($_COOKIE['cookielawinfo-checkbox-functional']) && $_COOKIE['cookielawinfo-checkbox-functional'] === 'yes' ? 'GRANTED' : 'DENIED';
-        return $state;
+        $marketing = $_COOKIE['cookielawinfo-checkbox-advertisement'] === 'yes';
+        $analytics = ! empty($_COOKIE['cookielawinfo-checkbox-analytics']) && $_COOKIE['cookielawinfo-checkbox-analytics'] === 'yes';
+        return [
+            'analytics'          => $analytics ? 'GRANTED' : 'DENIED',
+            'marketing'          => $marketing ? 'GRANTED' : 'DENIED',
+            'ad_user_data'       => $marketing ? 'GRANTED' : 'DENIED',
+            'ad_personalization' => $marketing ? 'GRANTED' : 'DENIED',
+            'source'             => 'webtoffee',
+            'captured_at'        => current_time('mysql'),
+        ];
     }
 
-    // Generic fallback
-    if ( ! empty($_COOKIE['cookie_consent']) ) {
-        $val = strtolower($_COOKIE['cookie_consent']);
-        if ( in_array($val, ['accepted', 'granted', 'yes', 'true', '1'], true) ) {
-            $state['ad_user_data']       = 'GRANTED';
-            $state['ad_personalization'] = 'DENIED';  // conservative default
-        }
-    }
-
-    return $state;
+    return []; // necunoscut -> tratat DENIED la gate
 }
 
-// === Hook tranzitii status — AMBELE processing + completed ===
-add_action('woocommerce_order_status_processing', 'safebiz_ga4_server_purchase', 10, 1);
-add_action('woocommerce_order_status_completed',  'safebiz_ga4_server_purchase', 10, 1);
-
-function safebiz_ga4_server_purchase($order_id) {
-    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) {
-        return;
+/** Helper: extrage o categorie de consimtamant din snapshot, default DENIED. */
+function safebiz_consent_val($consent_state, $key) {
+    if ( is_array($consent_state) && ! empty($consent_state[$key]) && $consent_state[$key] === 'GRANTED' ) {
+        return 'GRANTED';
     }
+    return 'DENIED';
+}
 
+// ============================================================
+// DISPATCH: la processing/completed -> enqueue async (Action Scheduler) GA4 + Meta
+// ============================================================
+add_action('woocommerce_order_status_processing', 'safebiz_enqueue_purchase_jobs', 10, 1);
+add_action('woocommerce_order_status_completed',  'safebiz_enqueue_purchase_jobs', 10, 1);
+
+add_action('safebiz_send_ga4_purchase',  'safebiz_send_ga4_purchase', 10, 1);
+add_action('safebiz_send_meta_purchase', 'safebiz_send_meta_purchase', 10, 1);
+
+/**
+ * Dispatch job. Return:
+ *   >0  = action_id (enqueue Action Scheduler reusit)
+ *    0  = enqueue ESUAT (apelantul trebuie sa nu lase order-ul 'queued' orfan)
+ *   -1  = rulat sincron (Action Scheduler indisponibil) — deja procesat, nu ramane 'queued'
+ */
+function safebiz_dispatch_job($hook, $order_id) {
+    if ( function_exists('as_enqueue_async_action') ) {
+        return (int) as_enqueue_async_action($hook, [ (int) $order_id ], 'safebiz-tracking');
+    }
+    do_action($hook, (int) $order_id); // fallback sincron daca Action Scheduler lipseste
+    return -1;
+}
+
+function safebiz_enqueue_purchase_jobs($order_id) {
     $order = wc_get_order($order_id);
     if ( ! $order ) return;
+    if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
 
-    // FILTRU STATUS WHITELIST (fix bug #196 trash contamination)
-    $valid_statuses = ['processing', 'completed'];
-    if ( ! in_array($order->get_status(), $valid_statuses, true) ) {
-        return;
-    }
-
-    // DEDUP cu status tracking (NU flag orb)
-    $current_status = $order->get_meta('_safebiz_ga4_mp_status');
-    if ( in_array($current_status, ['queued', 'sent', 'skipped_no_consent'], true) ) {
-        return;
-    }
-
-    // CONSENT GATE — strict opt-in pentru Art. 9 sites
-    $consent_state = $order->get_meta('_safebiz_consent_state');
-    if ( defined('SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT') && SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT === true ) {
-        if ( ! is_array($consent_state) || empty($consent_state['ad_user_data']) || $consent_state['ad_user_data'] !== 'GRANTED' ) {
-            $order->update_meta_data('_safebiz_ga4_mp_status', 'skipped_no_consent');
+    // GA4 — marcheaza queued (lock idempotency: a 2-a tranzitie vede queued si nu re-enqueue)
+    if ( defined('SAFEBIZ_GA4_MEASUREMENT_ID') && defined('SAFEBIZ_GA4_API_SECRET') ) {
+        $st = $order->get_meta('_safebiz_ga4_mp_status');
+        if ( ! in_array($st, ['queued', 'sent', 'skipped_no_consent'], true) ) {
+            $order->update_meta_data('_safebiz_ga4_mp_status', 'queued');
             $order->update_meta_data('_safebiz_ga4_mp_queued_at', current_time('mysql'));
             $order->save();
-            error_log('[SafeBiz-GA4] Order #' . $order->get_order_number() . ' SKIPPED — no explicit consent');
-            return;
+            if ( safebiz_dispatch_job('safebiz_send_ga4_purchase', $order_id) === 0 ) {
+                // enqueue Action Scheduler esuat -> 'error' ca retry-ul orar sa-l recupereze
+                $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
+                $order->update_meta_data('_safebiz_ga4_mp_error', 'enqueue failed (Action Scheduler)');
+                $order->save();
+            }
         }
     }
 
-    // Marchez QUEUED inainte de POST (idempotency)
-    $order->update_meta_data('_safebiz_ga4_mp_status', 'queued');
-    $order->update_meta_data('_safebiz_ga4_mp_queued_at', current_time('mysql'));
-    $order->save();
+    // Meta CAPI
+    if ( defined('SAFEBIZ_META_PIXEL_ID') && defined('SAFEBIZ_META_CAPI_TOKEN') ) {
+        $st = $order->get_meta('_safebiz_meta_capi_status');
+        if ( ! in_array($st, ['queued', 'sent', 'skipped_no_consent', 'skipped_stale'], true) ) {
+            $order->update_meta_data('_safebiz_meta_capi_status', 'queued');
+            $order->update_meta_data('_safebiz_meta_capi_queued_at', current_time('mysql'));
+            $order->save();
+            if ( safebiz_dispatch_job('safebiz_send_meta_purchase', $order_id) === 0 ) {
+                // enqueue Action Scheduler esuat -> 'error' ca retry-ul orar sa-l recupereze
+                $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+                $order->update_meta_data('_safebiz_meta_capi_error', 'enqueue failed (Action Scheduler)');
+                $order->save();
+            }
+        }
+    }
+}
 
-    // BUILD PAYLOAD
-    // Default consent conservator per Codex review 2026-05-12:
-    // Fara consent snapshot explicit, NU asumam GRANTED. Trimitem purchase pentru
-    // analytics minim cu ad flags DENIED (mai sigur legal, evita marketing leak).
-    $consent_to_send = is_array($consent_state) && ! empty($consent_state['ad_user_data'])
-        ? $consent_state
-        : [
-            'ad_user_data'       => 'DENIED',
-            'ad_personalization' => 'DENIED',
-        ];
+// ============================================================
+// GA4 Measurement Protocol — gate pe ANALYTICS
+// ============================================================
+function safebiz_send_ga4_purchase($order_id) {
+    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) return;
+    $order = wc_get_order($order_id);
+    if ( ! $order ) return;
+    if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
+    if ( $order->get_meta('_safebiz_ga4_mp_status') === 'sent' ) return;
+
+    $consent_state = $order->get_meta('_safebiz_consent_state');
+    $analytics = safebiz_consent_val($consent_state, 'analytics');
+    $marketing = safebiz_consent_val($consent_state, 'marketing');
+
+    // Gate: daca cerem consimtamant explicit (recomandat GDPR) -> analytics trebuie GRANTED
+    $require = defined('SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT') && SAFEBIZ_GA4_REQUIRE_EXPLICIT_CONSENT === true;
+    if ( $require && $analytics !== 'GRANTED' ) {
+        $order->update_meta_data('_safebiz_ga4_mp_status', 'skipped_no_consent');
+        $order->save();
+        error_log('[SafeBiz-GA4] #' . $order->get_order_number() . ' SKIP — analytics consent absent');
+        return;
+    }
 
     $payload = [
         'client_id'        => safebiz_get_client_id($order),
-        'consent'          => $consent_to_send,
+        'consent'          => [
+            'ad_user_data'       => $marketing,   // ad signals din marketing consent
+            'ad_personalization' => $marketing,
+        ],
         'timestamp_micros' => (int) ($order->get_date_created()->getTimestamp() * 1000000),
-        'events'           => [[
-            'name'   => 'purchase',
-            'params' => safebiz_build_purchase_params($order),
-        ]],
+        'events'           => [[ 'name' => 'purchase', 'params' => safebiz_build_purchase_params($order) ]],
     ];
 
-    // POST blocking pentru verificare response real
-    // Endpoint regional EU per Codex review 2026-05-12 — mai aliniat stack EU-first
-    $url = sprintf(
-        'https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
-        urlencode(SAFEBIZ_GA4_MEASUREMENT_ID),
-        urlencode(SAFEBIZ_GA4_API_SECRET)
-    );
+    $url = sprintf('https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
+        urlencode(SAFEBIZ_GA4_MEASUREMENT_ID), urlencode(SAFEBIZ_GA4_API_SECRET));
 
     $response = wp_remote_post($url, [
-        'headers'  => ['Content-Type' => 'application/json'],
-        'body'     => wp_json_encode($payload),
-        'timeout'  => 10,
-        'blocking' => true,
+        'headers' => ['Content-Type' => 'application/json'],
+        'body'    => wp_json_encode($payload), 'timeout' => 10, 'blocking' => true,
     ]);
 
-    // VERIFICARE RESPONSE REAL
     if ( is_wp_error($response) ) {
         $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
         $order->update_meta_data('_safebiz_ga4_mp_error', $response->get_error_message());
-        error_log('[SafeBiz-GA4] Order #' . $order->get_order_number() . ' ERR: ' . $response->get_error_message());
+    } elseif ( wp_remote_retrieve_response_code($response) === 204 ) {
+        $order->update_meta_data('_safebiz_ga4_mp_status', 'sent');
+        $order->update_meta_data('_safebiz_ga4_mp_sent_at', current_time('mysql'));
     } else {
-        $code = wp_remote_retrieve_response_code($response);
-        if ( $code === 204 ) {
-            $order->update_meta_data('_safebiz_ga4_mp_status', 'sent');
-            $order->update_meta_data('_safebiz_ga4_mp_sent_at', current_time('mysql'));
-        } else {
-            $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
-            $order->update_meta_data('_safebiz_ga4_mp_error', 'HTTP ' . $code . ' body: ' . substr(wp_remote_retrieve_body($response), 0, 200));
-            error_log('[SafeBiz-GA4] Order #' . $order->get_order_number() . ' HTTP ' . $code);
-        }
+        $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
+        $order->update_meta_data('_safebiz_ga4_mp_error', 'HTTP ' . wp_remote_retrieve_response_code($response) . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
     }
     $order->save();
 }
 
-/**
- * Build params purchase — fara PII, configurabil pentru Art. 9 sites.
- */
 function safebiz_build_purchase_params($order) {
     $params = [
         'transaction_id' => (string) $order->get_order_number(),
@@ -255,7 +361,14 @@ function safebiz_build_purchase_params($order) {
         'coupon'         => implode(',', $order->get_coupon_codes()),
     ];
 
-    // Items array — EXCLUSE pentru site-uri Art. 9 (MPSS)
+    // GA4 session join — leaga purchase-ul de sesiunea reala a userului (capturata la checkout).
+    // Fara session_id, GA4 porneste o sesiune noua fara sursa -> tranzactia apare ca (not set).
+    $session_id = $order->get_meta('_ga_session_id');
+    if ( ! empty($session_id) ) {
+        $params['session_id']           = $session_id;
+        $params['engagement_time_msec'] = 1;
+    }
+
     if ( defined('SAFEBIZ_GA4_SEND_ITEMS') && SAFEBIZ_GA4_SEND_ITEMS === true ) {
         $items = [];
         foreach ( $order->get_items('line_item') as $item ) {
@@ -270,104 +383,260 @@ function safebiz_build_purchase_params($order) {
         }
         $params['items'] = $items;
     }
-
     return $params;
 }
 
-/**
- * Get client_id — incearca _ga cookie din order meta, fallback la hash.
- */
 function safebiz_get_client_id($order) {
     $client_id = $order->get_meta('_ga_client_id');
-    if ( ! empty($client_id) ) return $client_id;
-
-    return wp_hash('order_' . $order->get_order_number());
+    return ! empty($client_id) ? $client_id : wp_hash('order_' . $order->get_order_number());
 }
 
-// === Refund event la cancelled/refunded ===
+// ============================================================
+// META CONVERSIONS API — gate STRICT pe MARKETING
+// ============================================================
+function safebiz_send_meta_purchase($order_id) {
+    if ( ! defined('SAFEBIZ_META_PIXEL_ID') || ! defined('SAFEBIZ_META_CAPI_TOKEN') ) return;
+    $order = wc_get_order($order_id);
+    if ( ! $order ) return;
+    if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
+    if ( $order->get_meta('_safebiz_meta_capi_status') === 'sent' ) return;
+
+    // GATE STRICT: marketing consent obligatoriu (default true; configurabil)
+    $require = ! defined('SAFEBIZ_META_CAPI_REQUIRE_EXPLICIT_CONSENT') || SAFEBIZ_META_CAPI_REQUIRE_EXPLICIT_CONSENT === true;
+    $marketing = safebiz_consent_val($order->get_meta('_safebiz_consent_state'), 'marketing');
+    if ( $require && $marketing !== 'GRANTED' ) {
+        $order->update_meta_data('_safebiz_meta_capi_status', 'skipped_no_consent');
+        $order->save();
+        error_log('[SafeBiz-Meta] #' . $order->get_order_number() . ' SKIP — marketing consent absent');
+        return;
+    }
+
+    // event_time = data conversiei; skip daca > 7 zile (Meta respinge)
+    $event_time = safebiz_order_event_time($order);
+    if ( $event_time < ( time() - 7 * DAY_IN_SECONDS ) ) {
+        $order->update_meta_data('_safebiz_meta_capi_status', 'skipped_stale');
+        $order->save();
+        return;
+    }
+
+    // event_id = "wc_order_" + ORDER NUMBER (= transaction_id pe care GTM Kit il pune in browser)
+    // pentru dedup corect browser pixel <-> server CAPI. NU get_id() (difera de number cand exista
+    // numerotare secventiala WC: ex id=55617 dar number=208).
+    $event = [
+        'event_name'       => 'Purchase',
+        'event_time'       => $event_time,
+        'event_id'         => 'wc_order_' . $order->get_order_number(),
+        'action_source'    => 'website',
+        'event_source_url' => safebiz_order_source_url($order),
+        'user_data'        => safebiz_meta_user_data($order),
+        'custom_data'      => safebiz_meta_custom_data($order),
+    ];
+
+    $body = [ 'data' => [ $event ] ];
+    if ( defined('SAFEBIZ_META_TEST_EVENT_CODE') && SAFEBIZ_META_TEST_EVENT_CODE !== '' ) {
+        $body['test_event_code'] = SAFEBIZ_META_TEST_EVENT_CODE;
+    }
+
+    $url = sprintf('https://graph.facebook.com/%s/%s/events?access_token=%s',
+        safebiz_meta_graph_version(), urlencode(SAFEBIZ_META_PIXEL_ID), urlencode(SAFEBIZ_META_CAPI_TOKEN));
+
+    $response = wp_remote_post($url, [
+        'headers' => ['Content-Type' => 'application/json'],
+        'body'    => wp_json_encode($body), 'timeout' => 15, 'blocking' => true,
+    ]);
+
+    $order->update_meta_data('_safebiz_meta_capi_event_id', $event['event_id']);
+    if ( is_wp_error($response) ) {
+        $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+        $order->update_meta_data('_safebiz_meta_capi_error', $response->get_error_message());
+    } else {
+        $code = wp_remote_retrieve_response_code($response);
+        $resp = json_decode(wp_remote_retrieve_body($response), true);
+        if ( $code === 200 && is_array($resp) && ! empty($resp['events_received']) ) {
+            $order->update_meta_data('_safebiz_meta_capi_status', 'sent');
+            $order->update_meta_data('_safebiz_meta_capi_sent_at', current_time('mysql'));
+            $order->update_meta_data('_safebiz_meta_capi_fbtrace', $resp['fbtrace_id'] ?? '');
+        } else {
+            $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+            $order->update_meta_data('_safebiz_meta_capi_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 300));
+            error_log('[SafeBiz-Meta] #' . $order->get_order_number() . ' HTTP ' . $code);
+        }
+    }
+    $order->save();
+}
+
+/** event_time real: date_paid -> date_completed -> date_created. */
+function safebiz_order_event_time($order) {
+    foreach ( ['get_date_paid', 'get_date_completed', 'get_date_created'] as $m ) {
+        if ( method_exists($order, $m) ) {
+            $d = $order->$m();
+            if ( $d ) return $d->getTimestamp();
+        }
+    }
+    return time();
+}
+
+function safebiz_order_source_url($order) {
+    $entry = $order->get_meta('_wc_order_attribution_session_entry');
+    if ( $entry ) return $entry;
+    return function_exists('wc_get_checkout_url') ? wc_get_checkout_url() : home_url('/');
+}
+
+function safebiz_meta_user_data($order) {
+    $ud = [];
+    if ( $order->get_billing_email() )      $ud['em']      = [ safebiz_hash($order->get_billing_email()) ];
+    $ph = safebiz_norm_phone($order->get_billing_phone());
+    if ( $ph )                              $ud['ph']      = [ safebiz_hash($ph) ];
+    if ( $order->get_billing_first_name() ) $ud['fn']      = [ safebiz_hash($order->get_billing_first_name()) ];
+    if ( $order->get_billing_last_name() )  $ud['ln']      = [ safebiz_hash($order->get_billing_last_name()) ];
+    if ( $order->get_billing_city() )       $ud['ct']      = [ safebiz_hash(preg_replace('/\s+/', '', $order->get_billing_city())) ];
+    if ( $order->get_billing_state() )      $ud['st']      = [ safebiz_hash($order->get_billing_state()) ];
+    if ( $order->get_billing_postcode() )   $ud['zp']      = [ safebiz_hash($order->get_billing_postcode()) ];
+    if ( $order->get_billing_country() )    $ud['country'] = [ safebiz_hash($order->get_billing_country()) ];
+
+    // external_id stabil: customer_id sau hash email
+    $cid = $order->get_customer_id();
+    if ( $cid ) {
+        $ud['external_id'] = [ safebiz_hash('cust_' . $cid) ];
+    } elseif ( $order->get_billing_email() ) {
+        $ud['external_id'] = [ safebiz_hash($order->get_billing_email()) ];
+    }
+
+    if ( $order->get_customer_ip_address() ) $ud['client_ip_address'] = $order->get_customer_ip_address();
+    $ua = $order->get_meta('_safebiz_client_ua') ?: $order->get_customer_user_agent();
+    if ( $ua ) $ud['client_user_agent'] = $ua;
+    if ( $order->get_meta('_fbp') ) $ud['fbp'] = $order->get_meta('_fbp');
+    if ( $order->get_meta('_fbc') ) $ud['fbc'] = $order->get_meta('_fbc');
+    return $ud;
+}
+
+function safebiz_meta_custom_data($order) {
+    $content_ids = []; $contents = [];
+    foreach ( $order->get_items('line_item') as $item ) {
+        $product = $item->get_product();
+        $pid = $product ? (string) $product->get_id() : (string) $item->get_product_id();
+        $qty = (int) $item->get_quantity();
+        $content_ids[] = $pid;
+        $contents[] = [
+            'id'         => $pid,
+            'quantity'   => $qty,
+            'item_price' => $qty ? round((float) $item->get_total() / $qty, 2) : (float) $item->get_total(),
+        ];
+    }
+    return [
+        'currency'     => $order->get_currency(),
+        'value'        => (float) wc_format_decimal($order->get_total(), 2),
+        'content_type' => 'product',
+        'content_ids'  => $content_ids,
+        'contents'     => $contents,
+        'order_id'     => (string) $order->get_id(),
+    ];
+}
+
+// ============================================================
+// Refund event GA4 (neschimbat — Meta refund out of scope v1.1.0)
+// ============================================================
 add_action('woocommerce_order_status_refunded',  'safebiz_ga4_refund_event', 10, 1);
 add_action('woocommerce_order_status_cancelled', 'safebiz_ga4_refund_event', 10, 1);
 
 function safebiz_ga4_refund_event($order_id) {
-    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) {
-        return;
-    }
-
+    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) return;
     $order = wc_get_order($order_id);
     if ( ! $order ) return;
     if ( $order->get_meta('_safebiz_ga4_mp_status') !== 'sent' ) return;
     if ( $order->get_meta('_safebiz_ga4_refund_sent') === '1' ) return;
 
-    $consent_state = $order->get_meta('_safebiz_consent_state');
-    // Default conservator per Codex review (vezi safebiz_ga4_server_purchase)
-    $consent_to_send = is_array($consent_state) && ! empty($consent_state['ad_user_data'])
-        ? $consent_state
-        : [
-            'ad_user_data'       => 'DENIED',
-            'ad_personalization' => 'DENIED',
-        ];
-
+    $marketing = safebiz_consent_val($order->get_meta('_safebiz_consent_state'), 'marketing');
     $payload = [
         'client_id' => safebiz_get_client_id($order),
-        'consent'   => $consent_to_send,
-        'events'    => [[
-            'name'   => 'refund',
-            'params' => [
-                'transaction_id' => (string) $order->get_order_number(),
-                'value'          => (float) wc_format_decimal($order->get_total(), 2),
-                'currency'       => $order->get_currency(),
-            ],
-        ]],
+        'consent'   => ['ad_user_data' => $marketing, 'ad_personalization' => $marketing],
+        'events'    => [[ 'name' => 'refund', 'params' => [
+            'transaction_id' => (string) $order->get_order_number(),
+            'value'          => (float) wc_format_decimal($order->get_total(), 2),
+            'currency'       => $order->get_currency(),
+        ]]],
     ];
-
-    // Endpoint regional EU per Codex review 2026-05-12 — mai aliniat stack EU-first
-    $url = sprintf(
-        'https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
-        urlencode(SAFEBIZ_GA4_MEASUREMENT_ID),
-        urlencode(SAFEBIZ_GA4_API_SECRET)
-    );
-
+    $url = sprintf('https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
+        urlencode(SAFEBIZ_GA4_MEASUREMENT_ID), urlencode(SAFEBIZ_GA4_API_SECRET));
     $response = wp_remote_post($url, [
-        'headers'  => ['Content-Type' => 'application/json'],
-        'body'     => wp_json_encode($payload),
-        'timeout'  => 10,
-        'blocking' => true,
+        'headers' => ['Content-Type' => 'application/json'],
+        'body'    => wp_json_encode($payload), 'timeout' => 10, 'blocking' => true,
     ]);
-
     if ( ! is_wp_error($response) && wp_remote_retrieve_response_code($response) === 204 ) {
         $order->update_meta_data('_safebiz_ga4_refund_sent', '1');
         $order->update_meta_data('_safebiz_ga4_refund_at', current_time('mysql'));
         $order->save();
-    } else {
-        $code = is_wp_error($response) ? 'WP_ERROR' : wp_remote_retrieve_response_code($response);
-        error_log('[SafeBiz-GA4] Refund #' . $order->get_order_number() . ' FAIL HTTP ' . $code);
     }
 }
 
-// === Cron hourly — retry pentru status='error' ===
+// ============================================================
+// Cron orar — retry GA4 + Meta status=error
+// ============================================================
 add_action('init', function() {
+    // GATE WooCommerce: pluginul poate fi activ si pe site-uri FARA WC (ex: salon-nunta.ro).
+    // Callback-urile de retry cheama wc_get_orders() -> fatal fara WC. Programeaza cronurile DOAR
+    // cand WC e prezent; daca WC lipseste (sau a fost dezinstalat), curata orice eveniment ramas.
+    if ( ! function_exists('wc_get_orders') ) {
+        wp_clear_scheduled_hook('safebiz_ga4_retry_errors');
+        wp_clear_scheduled_hook('safebiz_meta_capi_retry_errors');
+        return;
+    }
     if ( ! wp_next_scheduled('safebiz_ga4_retry_errors') ) {
         wp_schedule_event(time(), 'hourly', 'safebiz_ga4_retry_errors');
+    }
+    if ( ! wp_next_scheduled('safebiz_meta_capi_retry_errors') ) {
+        wp_schedule_event(time(), 'hourly', 'safebiz_meta_capi_retry_errors');
     }
 });
 
 add_action('safebiz_ga4_retry_errors', function() {
-    $args = [
-        'limit'      => 20,
-        'status'     => ['wc-processing', 'wc-completed'],
-        'meta_key'   => '_safebiz_ga4_mp_status',
-        'meta_value' => 'error',
-    ];
-    $orders = wc_get_orders($args);
+    if ( ! function_exists('wc_get_orders') ) return; // guard WC (defensiv, pe langa gate-ul de la init)
+    // recupereaza status=error SAU status=queued blocat (enqueue pierdut) mai vechi de 2h
+    $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - 2 * HOUR_IN_SECONDS);
+    $orders = wc_get_orders([
+        'limit'  => 20, 'status' => ['wc-processing', 'wc-completed'],
+        'meta_query' => [
+            'relation' => 'OR',
+            [ 'key' => '_safebiz_ga4_mp_status', 'value' => 'error' ],
+            [
+                'relation' => 'AND',
+                [ 'key' => '_safebiz_ga4_mp_status',    'value' => 'queued' ],
+                [ 'key' => '_safebiz_ga4_mp_queued_at', 'value' => $cutoff, 'compare' => '<' ],
+            ],
+        ],
+    ]);
     foreach ( $orders as $order ) {
-        // Reseteaza status pentru re-send
         $order->update_meta_data('_safebiz_ga4_mp_status', '');
         $order->save();
-        safebiz_ga4_server_purchase($order->get_id());
+        safebiz_send_ga4_purchase($order->get_id());
+    }
+});
+
+add_action('safebiz_meta_capi_retry_errors', function() {
+    if ( ! function_exists('wc_get_orders') ) return; // guard WC (defensiv, pe langa gate-ul de la init)
+    // recupereaza status=error SAU status=queued blocat (enqueue pierdut) mai vechi de 2h
+    $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - 2 * HOUR_IN_SECONDS);
+    $orders = wc_get_orders([
+        'limit'  => 20, 'status' => ['wc-processing', 'wc-completed'],
+        'meta_query' => [
+            'relation' => 'OR',
+            [ 'key' => '_safebiz_meta_capi_status', 'value' => 'error' ],
+            [
+                'relation' => 'AND',
+                [ 'key' => '_safebiz_meta_capi_status',    'value' => 'queued' ],
+                [ 'key' => '_safebiz_meta_capi_queued_at', 'value' => $cutoff, 'compare' => '<' ],
+            ],
+        ],
+    ]);
+    foreach ( $orders as $order ) {
+        $order->update_meta_data('_safebiz_meta_capi_status', '');
+        $order->save();
+        safebiz_send_meta_purchase($order->get_id());
     }
 });
 
 // === Cleanup la deactivation ===
 register_deactivation_hook(__FILE__, function() {
     wp_clear_scheduled_hook('safebiz_ga4_retry_errors');
+    wp_clear_scheduled_hook('safebiz_meta_capi_retry_errors');
 });
