@@ -1,0 +1,123 @@
+=== BASELINE wp-plugin-analyze v1.2.0 (pre-fix) â€” reper pt. Codex diff ===
+--- HOOKS ---
+# Analiza Plugin: SafeBiz Server-Side Tracking
+
+*Generat automat de wp-plugin-analyze.py*
+
+## Metadata
+
+| Camp | Valoare |
+|------|---------|
+| Plugin Name | SafeBiz Server-Side Tracking |
+| Plugin URI | https://github.com/safebiz/safebiz-server-side-tracking |
+| Description | Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub. |
+| Version | 1.2.0 |
+| Author | SafeBiz Solutions |
+| Author URI | https://safebiz.ro |
+| Text Domain | safebiz-server-side-tracking |
+| Requires at least | 6.0 |
+| Requires PHP | 7.4 |
+| License | GPL-2.0-or-later |
+
+## Registered Hooks (12 actions, 3 filters)
+
+### Top Actions (add_action)
+
+| Hook Name | Count |
+|-----------|-------|
+| `upgrader_process_complete` | 1 |
+| `admin_notices` | 1 |
+| `woocommerce_checkout_create_order` | 1 |
+| `woocommerce_order_status_processing` | 1 |
+| `woocommerce_order_status_completed` | 1 |
+| `safebiz_send_ga4_purchase` | 1 |
+| `safebiz_send_meta_purchase` | 1 |
+| `woocommerce_order_status_refunded` | 1 |
+| `woocommerce_order_status_cancelled` | 1 |
+| `init` | 1 |
+| `safebiz_ga4_retry_errors` | 1 |
+| `safebiz_meta_capi_retry_errors` | 1 |
+
+### Top Filters (add_filter)
+
+| Hook Name | Count |
+|-----------|-------|
+| `pre_set_site_transient_update_plugins` | 1 |
+| `plugins_api` | 1 |
+| `upgrader_source_selection` | 1 |
+
+--- CRON JOBS ---
+# Analiza Plugin: SafeBiz Server-Side Tracking
+
+*Generat automat de wp-plugin-analyze.py*
+
+## Metadata
+
+| Camp | Valoare |
+|------|---------|
+| Plugin Name | SafeBiz Server-Side Tracking |
+| Plugin URI | https://github.com/safebiz/safebiz-server-side-tracking |
+| Description | Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub. |
+| Version | 1.2.0 |
+| Author | SafeBiz Solutions |
+| Author URI | https://safebiz.ro |
+| Text Domain | safebiz-server-side-tracking |
+| Requires at least | 6.0 |
+| Requires PHP | 7.4 |
+| License | GPL-2.0-or-later |
+
+## Cron Jobs (2)
+
+- `hourly` — safebiz-server-side-tracking.php:585
+- `hourly` — safebiz-server-side-tracking.php:588
+
+--- WOO HOOKS ---
+# Analiza Plugin: SafeBiz Server-Side Tracking
+
+*Generat automat de wp-plugin-analyze.py*
+
+## Metadata
+
+| Camp | Valoare |
+|------|---------|
+| Plugin Name | SafeBiz Server-Side Tracking |
+| Plugin URI | https://github.com/safebiz/safebiz-server-side-tracking |
+| Description | Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub. |
+| Version | 1.2.0 |
+| Author | SafeBiz Solutions |
+| Author URI | https://safebiz.ro |
+| Text Domain | safebiz-server-side-tracking |
+| Requires at least | 6.0 |
+| Requires PHP | 7.4 |
+| License | GPL-2.0-or-later |
+
+## WooCommerce Integration (5 hooks)
+
+| Type | Hook Name | File |
+|------|-----------|------|
+| add_action | `woocommerce_checkout_create_order` | safebiz-server-side-tracking.php:85 |
+| add_action | `woocommerce_order_status_processing` | safebiz-server-side-tracking.php:242 |
+| add_action | `woocommerce_order_status_completed` | safebiz-server-side-tracking.php:243 |
+| add_action | `woocommerce_order_status_refunded` | safebiz-server-side-tracking.php:539 |
+| add_action | `woocommerce_order_status_cancelled` | safebiz-server-side-tracking.php:540 |
+
+--- REST ROUTES ---
+# Analiza Plugin: SafeBiz Server-Side Tracking
+
+*Generat automat de wp-plugin-analyze.py*
+
+## Metadata
+
+| Camp | Valoare |
+|------|---------|
+| Plugin Name | SafeBiz Server-Side Tracking |
+| Plugin URI | https://github.com/safebiz/safebiz-server-side-tracking |
+| Description | Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub. |
+| Version | 1.2.0 |
+| Author | SafeBiz Solutions |
+| Author URI | https://safebiz.ro |
+| Text Domain | safebiz-server-side-tracking |
+| Requires at least | 6.0 |
+| Requires PHP | 7.4 |
+| License | GPL-2.0-or-later |
+

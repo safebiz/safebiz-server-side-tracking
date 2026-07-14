@@ -3,7 +3,7 @@
  * Plugin Name: SafeBiz Server-Side Tracking
  * Plugin URI: https://github.com/safebiz/safebiz-server-side-tracking
  * Description: Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: SafeBiz Solutions
  * Author URI: https://safebiz.ro
  * License: GPL-2.0-or-later
@@ -35,9 +35,18 @@
  *   _ga_session_id            : GA4 session id (din cookie _ga_<id>) — join sesiune, pastreaza sursa
  *   _fbp / _fbc               : Meta browser identifiers (capturate la checkout)
  *   _safebiz_client_ua        : user-agent original
- *   _safebiz_ga4_mp_status    : queued | sent | error | skipped_no_consent
- *   _safebiz_meta_capi_status : queued | sent | error | skipped_no_consent | skipped_stale
+ *   _safebiz_ga4_mp_status    : queued | sent | skipped_no_consent | error_enqueue | error_ambiguous | error_http | error_stale
+ *   _safebiz_ga4_purchase_sent: '1' — flag DURABIL de LIVRARE (setat DOAR pe raspuns 2xx). Reconcilierea
+ *                               externa citeste ACEST flag ca sursa de adevar "livrat", NU status-ul.
+ *   _safebiz_meta_capi_status : queued | sent | skipped_no_consent | skipped_stale | error_enqueue | error_ambiguous | error_http
+ *   _safebiz_meta_capi_purchase_sent : '1' — flag DURABIL de LIVRARE Meta (setat DOAR pe 200 + events_received).
  *   _safebiz_meta_capi_*      : queued_at | sent_at | error | fbtrace | event_id
+ *
+ * v1.3.0 (fix overcount GA4): purchase = "exactly once". Un purchase e TERMINAL (nu se mai retrimite)
+ * cand a fost livrat (flag) SAU a atins o stare terminala. Retry-ul orar reia DOAR stari unde e sigur
+ * ca NU s-a facut POST catre Google/Meta: error_enqueue (Action Scheduler a esuat) + queued blocat.
+ * Dupa orice POST (2xx / non-2xx / is_wp_error) starea e terminala -> zero re-POST -> zero duplicate.
+ * Cutoff 72h (GA4 respinge timestamp_micros backdated > 72h) -> error_stale.
  */
 
 if ( ! defined('ABSPATH') ) exit;
@@ -237,6 +246,30 @@ function safebiz_consent_val($consent_state, $key) {
 }
 
 // ============================================================
+// Idempotenta durabila purchase (fix v1.3.0 overcount)
+// ============================================================
+/**
+ * Purchase GA4 e "terminal" (NU se mai retrimite) daca:
+ *   - a fost LIVRAT: flag _safebiz_ga4_purchase_sent === '1' (setat DOAR pe raspuns 2xx), SAU
+ *   - a atins o stare terminala fara re-POST util: skip consent / ambiguu (is_wp_error dupa POST) /
+ *     http (non-2xx) / stale (>72h).
+ * NB reconciliere: tool-urile externe folosesc FLAG-ul (livrare confirmata), NU acest helper.
+ * Helper-ul include si stari NE-livrate — doar ca bariera anti re-POST. Flag-ul nu se pune pe esec.
+ */
+function safebiz_ga4_purchase_is_terminal($order) {
+    if ( $order->get_meta('_safebiz_ga4_purchase_sent') === '1' ) return true;
+    return in_array($order->get_meta('_safebiz_ga4_mp_status'),
+        ['sent', 'skipped_no_consent', 'error_ambiguous', 'error_http', 'error_stale'], true);
+}
+
+/** Analog pentru Meta CAPI. Flag durabil _safebiz_meta_capi_purchase_sent (setat DOAR pe 200 valid). */
+function safebiz_meta_purchase_is_terminal($order) {
+    if ( $order->get_meta('_safebiz_meta_capi_purchase_sent') === '1' ) return true;
+    return in_array($order->get_meta('_safebiz_meta_capi_status'),
+        ['sent', 'skipped_no_consent', 'skipped_stale', 'error_ambiguous', 'error_http'], true);
+}
+
+// ============================================================
 // DISPATCH: la processing/completed -> enqueue async (Action Scheduler) GA4 + Meta
 // ============================================================
 add_action('woocommerce_order_status_processing', 'safebiz_enqueue_purchase_jobs', 10, 1);
@@ -264,16 +297,16 @@ function safebiz_enqueue_purchase_jobs($order_id) {
     if ( ! $order ) return;
     if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
 
-    // GA4 — marcheaza queued (lock idempotency: a 2-a tranzitie vede queued si nu re-enqueue)
+    // GA4 — enqueue DOAR daca nu e deja terminal (livrat/ambiguu/http/stale/skip) si nu e deja in coada.
+    // Guard #1 din 3 (enqueue). Vezi si top-of-send si foreach-ul din cron.
     if ( defined('SAFEBIZ_GA4_MEASUREMENT_ID') && defined('SAFEBIZ_GA4_API_SECRET') ) {
-        $st = $order->get_meta('_safebiz_ga4_mp_status');
-        if ( ! in_array($st, ['queued', 'sent', 'skipped_no_consent'], true) ) {
+        if ( ! safebiz_ga4_purchase_is_terminal($order) && $order->get_meta('_safebiz_ga4_mp_status') !== 'queued' ) {
             $order->update_meta_data('_safebiz_ga4_mp_status', 'queued');
             $order->update_meta_data('_safebiz_ga4_mp_queued_at', current_time('mysql'));
             $order->save();
             if ( safebiz_dispatch_job('safebiz_send_ga4_purchase', $order_id) === 0 ) {
-                // enqueue Action Scheduler esuat -> 'error' ca retry-ul orar sa-l recupereze
-                $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
+                // enqueue Action Scheduler esuat -> NU s-a facut POST -> error_enqueue (retry ORAR sigur, fara duplicat)
+                $order->update_meta_data('_safebiz_ga4_mp_status', 'error_enqueue');
                 $order->update_meta_data('_safebiz_ga4_mp_error', 'enqueue failed (Action Scheduler)');
                 $order->save();
             }
@@ -282,14 +315,13 @@ function safebiz_enqueue_purchase_jobs($order_id) {
 
     // Meta CAPI
     if ( defined('SAFEBIZ_META_PIXEL_ID') && defined('SAFEBIZ_META_CAPI_TOKEN') ) {
-        $st = $order->get_meta('_safebiz_meta_capi_status');
-        if ( ! in_array($st, ['queued', 'sent', 'skipped_no_consent', 'skipped_stale'], true) ) {
+        if ( ! safebiz_meta_purchase_is_terminal($order) && $order->get_meta('_safebiz_meta_capi_status') !== 'queued' ) {
             $order->update_meta_data('_safebiz_meta_capi_status', 'queued');
             $order->update_meta_data('_safebiz_meta_capi_queued_at', current_time('mysql'));
             $order->save();
             if ( safebiz_dispatch_job('safebiz_send_meta_purchase', $order_id) === 0 ) {
-                // enqueue Action Scheduler esuat -> 'error' ca retry-ul orar sa-l recupereze
-                $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+                // enqueue Action Scheduler esuat -> NU s-a facut POST -> error_enqueue (retry ORAR sigur, fara duplicat)
+                $order->update_meta_data('_safebiz_meta_capi_status', 'error_enqueue');
                 $order->update_meta_data('_safebiz_meta_capi_error', 'enqueue failed (Action Scheduler)');
                 $order->save();
             }
@@ -305,7 +337,9 @@ function safebiz_send_ga4_purchase($order_id) {
     $order = wc_get_order($order_id);
     if ( ! $order ) return;
     if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
-    if ( $order->get_meta('_safebiz_ga4_mp_status') === 'sent' ) return;
+    // Guard #2 din 3 (top-of-send): idempotenta durabila. Daca purchase-ul a fost LIVRAT sau e terminal,
+    // NU retrimite — supravietuieste oricarei resetari de status (bug-ul vechi stergea statusul in cron).
+    if ( safebiz_ga4_purchase_is_terminal($order) ) return;
 
     $consent_state = $order->get_meta('_safebiz_consent_state');
     $analytics = safebiz_consent_val($consent_state, 'analytics');
@@ -320,13 +354,24 @@ function safebiz_send_ga4_purchase($order_id) {
         return;
     }
 
+    // CUTOFF 72h: GA4 respinge (dropeaza silentios) evenimente cu timestamp_micros backdated > 72h.
+    // Retrimiterea unei comenzi mai vechi ar fi inutila -> marcheaza TERMINAL si scoate din bucla.
+    $created    = $order->get_date_created();
+    $created_ts = $created ? $created->getTimestamp() : time();
+    if ( $created_ts < ( time() - 3 * DAY_IN_SECONDS ) ) {
+        $order->update_meta_data('_safebiz_ga4_mp_status', 'error_stale');
+        $order->save();
+        error_log('[SafeBiz-GA4] #' . $order->get_order_number() . ' SKIP — comanda > 72h (GA4 respinge backdating)');
+        return;
+    }
+
     $payload = [
         'client_id'        => safebiz_get_client_id($order),
         'consent'          => [
             'ad_user_data'       => $marketing,   // ad signals din marketing consent
             'ad_personalization' => $marketing,
         ],
-        'timestamp_micros' => (int) ($order->get_date_created()->getTimestamp() * 1000000),
+        'timestamp_micros' => (int) ($created_ts * 1000000),
         'events'           => [[ 'name' => 'purchase', 'params' => safebiz_build_purchase_params($order) ]],
     ];
 
@@ -338,15 +383,27 @@ function safebiz_send_ga4_purchase($order_id) {
         'body'    => wp_json_encode($payload), 'timeout' => 10, 'blocking' => true,
     ]);
 
+    // "exactly once": ORICE rezultat dupa POST este TERMINAL -> zero re-POST -> zero duplicate.
+    // Retry-ul orar reia DOAR error_enqueue/queued-blocat (stari fara POST). Vezi cronul de mai jos.
     if ( is_wp_error($response) ) {
-        $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
+        // POST-ul a plecat dar raspunsul e necunoscut (timeout/retea). Evenimentul POATE a ajuns la Google
+        // (MP e fire-and-accept). NU auto-retrimite (asta genera overcount-ul). Terminal ambiguu;
+        // reconciliere manuala din WooCommerce daca e nevoie. NU se pune flag-ul de livrare.
+        $order->update_meta_data('_safebiz_ga4_mp_status', 'error_ambiguous');
         $order->update_meta_data('_safebiz_ga4_mp_error', $response->get_error_message());
-    } elseif ( wp_remote_retrieve_response_code($response) === 204 ) {
-        $order->update_meta_data('_safebiz_ga4_mp_status', 'sent');
-        $order->update_meta_data('_safebiz_ga4_mp_sent_at', current_time('mysql'));
     } else {
-        $order->update_meta_data('_safebiz_ga4_mp_status', 'error');
-        $order->update_meta_data('_safebiz_ga4_mp_error', 'HTTP ' . wp_remote_retrieve_response_code($response) . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
+        $code = (int) wp_remote_retrieve_response_code($response);
+        if ( $code >= 200 && $code < 300 ) {
+            // Raspuns 2xx = cererea a fost primita de Google (MP raspunde 2xx cand a primit requestul) -> LIVRAT.
+            $order->update_meta_data('_safebiz_ga4_mp_status', 'sent');
+            $order->update_meta_data('_safebiz_ga4_purchase_sent', '1'); // flag DURABIL de livrare (guard reset-proof)
+            $order->update_meta_data('_safebiz_ga4_mp_sent_at', current_time('mysql'));
+        } else {
+            // Non-2xx: cererea a ajuns la endpoint dar a fost respinsa la nivel HTTP. Per Google, un non-2xx
+            // inseamna "corecteaza cererea", NU "retrimite aceeasi cerere" -> terminal, fara re-POST.
+            $order->update_meta_data('_safebiz_ga4_mp_status', 'error_http');
+            $order->update_meta_data('_safebiz_ga4_mp_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
+        }
     }
     $order->save();
 }
@@ -399,7 +456,8 @@ function safebiz_send_meta_purchase($order_id) {
     $order = wc_get_order($order_id);
     if ( ! $order ) return;
     if ( ! in_array($order->get_status(), ['processing', 'completed'], true) ) return;
-    if ( $order->get_meta('_safebiz_meta_capi_status') === 'sent' ) return;
+    // Guard #2 din 3 (top-of-send): idempotenta durabila Meta (reset-proof).
+    if ( safebiz_meta_purchase_is_terminal($order) ) return;
 
     // GATE STRICT: marketing consent obligatoriu (default true; configurabil)
     $require = ! defined('SAFEBIZ_META_CAPI_REQUIRE_EXPLICIT_CONSENT') || SAFEBIZ_META_CAPI_REQUIRE_EXPLICIT_CONSENT === true;
@@ -446,18 +504,23 @@ function safebiz_send_meta_purchase($order_id) {
     ]);
 
     $order->update_meta_data('_safebiz_meta_capi_event_id', $event['event_id']);
+    // "exactly once" (simetric cu GA4): dupa POST orice rezultat e TERMINAL. Meta are si dedup nativ pe
+    // event_id, dar nu ne bazam pe el — garzile durabile fac calea corecta la sursa.
     if ( is_wp_error($response) ) {
-        $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+        // POST plecat, raspuns necunoscut -> ambiguu; NU auto-retrimite. Fara flag de livrare.
+        $order->update_meta_data('_safebiz_meta_capi_status', 'error_ambiguous');
         $order->update_meta_data('_safebiz_meta_capi_error', $response->get_error_message());
     } else {
         $code = wp_remote_retrieve_response_code($response);
         $resp = json_decode(wp_remote_retrieve_body($response), true);
         if ( $code === 200 && is_array($resp) && ! empty($resp['events_received']) ) {
             $order->update_meta_data('_safebiz_meta_capi_status', 'sent');
+            $order->update_meta_data('_safebiz_meta_capi_purchase_sent', '1'); // flag DURABIL de livrare
             $order->update_meta_data('_safebiz_meta_capi_sent_at', current_time('mysql'));
             $order->update_meta_data('_safebiz_meta_capi_fbtrace', $resp['fbtrace_id'] ?? '');
         } else {
-            $order->update_meta_data('_safebiz_meta_capi_status', 'error');
+            // Raspuns primit dar nevalidat de Meta -> terminal, fara re-POST (evita duplicate).
+            $order->update_meta_data('_safebiz_meta_capi_status', 'error_http');
             $order->update_meta_data('_safebiz_meta_capi_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 300));
             error_log('[SafeBiz-Meta] #' . $order->get_order_number() . ' HTTP ' . $code);
         }
@@ -589,15 +652,19 @@ add_action('init', function() {
     }
 });
 
+// FIX v1.3.0: retry-ul reia DOAR stari unde e sigur ca NU s-a facut POST catre Google:
+//   - error_enqueue: Action Scheduler nu a pornit jobul (zero POST)
+//   - queued blocat > 2h: jobul nu a rulat niciodata (zero POST)
+// NU mai reia error_ambiguous/error_http/error_stale (POST-ul poate a ajuns -> ar face duplicate).
+// FARA status-wipe: send() se auto-protejeaza prin guard-ul terminal durabil.
 add_action('safebiz_ga4_retry_errors', function() {
     if ( ! function_exists('wc_get_orders') ) return; // guard WC (defensiv, pe langa gate-ul de la init)
-    // recupereaza status=error SAU status=queued blocat (enqueue pierdut) mai vechi de 2h
     $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - 2 * HOUR_IN_SECONDS);
     $orders = wc_get_orders([
         'limit'  => 20, 'status' => ['wc-processing', 'wc-completed'],
         'meta_query' => [
             'relation' => 'OR',
-            [ 'key' => '_safebiz_ga4_mp_status', 'value' => 'error' ],
+            [ 'key' => '_safebiz_ga4_mp_status', 'value' => 'error_enqueue' ],
             [
                 'relation' => 'AND',
                 [ 'key' => '_safebiz_ga4_mp_status',    'value' => 'queued' ],
@@ -606,21 +673,20 @@ add_action('safebiz_ga4_retry_errors', function() {
         ],
     ]);
     foreach ( $orders as $order ) {
-        $order->update_meta_data('_safebiz_ga4_mp_status', '');
-        $order->save();
+        // Guard #3 din 3 (cron foreach): bariera de cod, nu ne bazam doar pe meta_query.
+        if ( safebiz_ga4_purchase_is_terminal($order) ) continue;
         safebiz_send_ga4_purchase($order->get_id());
     }
 });
 
 add_action('safebiz_meta_capi_retry_errors', function() {
     if ( ! function_exists('wc_get_orders') ) return; // guard WC (defensiv, pe langa gate-ul de la init)
-    // recupereaza status=error SAU status=queued blocat (enqueue pierdut) mai vechi de 2h
     $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - 2 * HOUR_IN_SECONDS);
     $orders = wc_get_orders([
         'limit'  => 20, 'status' => ['wc-processing', 'wc-completed'],
         'meta_query' => [
             'relation' => 'OR',
-            [ 'key' => '_safebiz_meta_capi_status', 'value' => 'error' ],
+            [ 'key' => '_safebiz_meta_capi_status', 'value' => 'error_enqueue' ],
             [
                 'relation' => 'AND',
                 [ 'key' => '_safebiz_meta_capi_status',    'value' => 'queued' ],
@@ -629,11 +695,81 @@ add_action('safebiz_meta_capi_retry_errors', function() {
         ],
     ]);
     foreach ( $orders as $order ) {
-        $order->update_meta_data('_safebiz_meta_capi_status', '');
-        $order->save();
+        if ( safebiz_meta_purchase_is_terminal($order) ) continue;
         safebiz_send_meta_purchase($order->get_id());
     }
 });
+
+// ============================================================
+// Migrare one-time la 1.3.0 — opreste bucla pentru comenzile EXISTENTE + backfill onest al flagului
+// ============================================================
+// Reclasifica statusurile vechi in vocabularul nou SI pune flag-ul de livrare DOAR pe dovada pozitiva.
+// Corectie Codex: NU marca 'error' generic ca livrat — poate fi enqueue-failure (zero POST) si am pierde
+// permanent comenzi netrimise. Regula:
+//   - status 'sent' SAU exista _sent_at  -> purchase_sent='1' (livrare confirmata)
+//   - status 'error' cu eroare 'enqueue failed' -> error_enqueue (fara POST -> retry sigur)
+//   - status 'error' (POSTat >=1) sau '' (sters de cronul vechi mid-flight) -> error_ambiguous (TERMINAL,
+//     NU marcat livrat) -> bucla se opreste, reconcilierea ramane onesta.
+add_action('init', 'safebiz_sst_maybe_migrate_130', 20);
+function safebiz_sst_maybe_migrate_130() {
+    if ( ! function_exists('wc_get_orders') ) return; // fara WC (salon-nunta) nu exista comenzi de migrat
+    if ( version_compare( (string) get_option('safebiz_sst_db_version', '0'), '1.3.0', '>=' ) ) return;
+
+    $page = 1;
+    do {
+        $orders = wc_get_orders([
+            'limit'  => 100, 'page' => $page, 'return' => 'objects',
+            'status' => ['wc-processing', 'wc-completed', 'wc-refunded', 'wc-cancelled', 'wc-on-hold'],
+            'meta_query' => [
+                'relation' => 'OR',
+                [ 'key' => '_safebiz_ga4_mp_status',    'compare' => 'EXISTS' ],
+                [ 'key' => '_safebiz_meta_capi_status', 'compare' => 'EXISTS' ],
+            ],
+        ]);
+        if ( empty($orders) ) break;
+        foreach ( $orders as $order ) { safebiz_sst_migrate_order_130($order); }
+        $page++;
+    } while ( count($orders) === 100 && $page <= 100 ); // plafon dur 10.000 comenzi (magazinele flotei sunt mici)
+
+    update_option('safebiz_sst_db_version', '1.3.0', false);
+}
+
+/** Idempotent: actioneaza DOAR pe stari legacy; comenzile deja in vocabular nou / cu flag sunt sarite. */
+function safebiz_sst_migrate_order_130($order) {
+    $changed = false;
+
+    // ---- GA4 ----
+    if ( $order->get_meta('_safebiz_ga4_purchase_sent') !== '1' ) {
+        $st = $order->get_meta('_safebiz_ga4_mp_status');
+        if ( $st === 'sent' || $order->get_meta('_safebiz_ga4_mp_sent_at') ) {
+            $order->update_meta_data('_safebiz_ga4_purchase_sent', '1');
+            if ( $st !== 'sent' ) $order->update_meta_data('_safebiz_ga4_mp_status', 'sent');
+            $changed = true;
+        } elseif ( $st === 'error' || $st === '' ) {
+            $err = (string) $order->get_meta('_safebiz_ga4_mp_error');
+            $order->update_meta_data('_safebiz_ga4_mp_status',
+                ( $st === 'error' && stripos($err, 'enqueue failed') !== false ) ? 'error_enqueue' : 'error_ambiguous');
+            $changed = true;
+        }
+    }
+
+    // ---- Meta CAPI ----
+    if ( $order->get_meta('_safebiz_meta_capi_purchase_sent') !== '1' ) {
+        $mst = $order->get_meta('_safebiz_meta_capi_status');
+        if ( $mst === 'sent' || $order->get_meta('_safebiz_meta_capi_sent_at') ) {
+            $order->update_meta_data('_safebiz_meta_capi_purchase_sent', '1');
+            if ( $mst !== 'sent' ) $order->update_meta_data('_safebiz_meta_capi_status', 'sent');
+            $changed = true;
+        } elseif ( $mst === 'error' || $mst === '' ) {
+            $merr = (string) $order->get_meta('_safebiz_meta_capi_error');
+            $order->update_meta_data('_safebiz_meta_capi_status',
+                ( $mst === 'error' && stripos($merr, 'enqueue failed') !== false ) ? 'error_enqueue' : 'error_ambiguous');
+            $changed = true;
+        }
+    }
+
+    if ( $changed ) $order->save();
+}
 
 // === Cleanup la deactivation ===
 register_deactivation_hook(__FILE__, function() {

@@ -2,6 +2,28 @@
 
 Toate modificările notabile la `safebiz-server-side-tracking` sunt documentate aici. Format conform [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versionare conform [SemVer](https://semver.org/lang/ro/).
 
+## [1.3.0] - 2026-07-14
+
+### Fixed
+
+- **GA4 purchase over-count (~28× pe MPSS: ~560 events/30z vs ~10-20 comenzi reale).** Cauza: cronul orar `safebiz_ga4_retry_errors` ștergea singura stare de dedup (`_safebiz_ga4_mp_status → ''`) și re-trimitea același `purchase` la nesfârșit, backdatat la data comenzii (amprentă: „73 identic pe 5 zile"). Succesul era acceptat doar pe HTTP 204 exact, deci orice timeout/răspuns lent marca `error` un eveniment deja înregistrat de GA4 → buclă infinită.
+
+### Changed — model „exactly once" (idempotență durabilă, reset-proof)
+
+- **Flag durabil de LIVRARE** `_safebiz_ga4_purchase_sent = '1'` (+ `_safebiz_meta_capi_purchase_sent`), setat **DOAR pe răspuns 2xx** (resp. Meta 200 + `events_received`). Replică pattern-ul corect deja existent la refund (`_safebiz_ga4_refund_sent`). Reconcilierea externă citește **acest flag** ca sursă de adevăr „livrat", nu status-ul.
+- **Separare strictă „livrat" vs „terminal".** După ORICE POST, starea devine terminală → zero re-POST → zero duplicate. Vocabular nou de status:
+  - `sent` (2xx, livrat) · `error_ambiguous` (`is_wp_error` după POST — poate a ajuns, NU se retrimite) · `error_http` (non-2xx — per Google „corectează cererea, nu retrimite") · `error_stale` (>72h) · `error_enqueue` (Action Scheduler a eșuat — **zero POST**, retry sigur).
+- **Retry-ul orar reia DOAR stări fără POST** (`error_enqueue` + `queued` blocat >2h). Nu mai atinge `error_ambiguous/error_http/error_stale`. **Status-wipe-ul a fost eliminat.**
+- **Cutoff 72h**: GA4 respinge `timestamp_micros` backdatat >72h → comenzile vechi se marchează `error_stale` terminal (nu se mai trimit inutil).
+- **Gardă în 3 locuri** (enqueue, top-of-send, foreach-ul cronului) via helper `safebiz_{ga4,meta}_purchase_is_terminal()` — `meta_query` rămâne optimizare, nu bariera unică.
+- **Migrare one-time la upgrade** (`safebiz_sst_db_version`): oprește bucla pentru comenzile existente. Backfill `purchase_sent='1'` **doar pe dovadă pozitivă** (`status=sent` sau `_sent_at` existent); `error` cu „enqueue failed" → `error_enqueue`; restul `error`/`''` → `error_ambiguous` terminal (NU marcat fals „livrat", ca reconcilierea să rămână onestă).
+
+### Notes
+
+- Corecții integrate din contra-verificarea Codex (2026-07-14): flag DOAR pe 2xx (nu pe eșec permanent); migrare restrânsă (nu marca `error` generic ca livrat); fără auto-retry după POST (incompatibil cu „exactly once"); cutoff 72h; gardă în cod, nu doar `meta_query`.
+- Fără schimbări la consent gating, `session_id` join, construcția payload-ului sau refund. Guard-urile WooCommerce (`function_exists`) rămân intacte → salon-nunta.ro (fără WC) nu are fatal.
+- Datele GA4 istorice inflatate NU pot fi șterse (MP nu are purge) — raportează venit din WooCommerce pentru fereastra afectată.
+
 ## [1.0.2] - 2026-05-12
 
 ### Added
