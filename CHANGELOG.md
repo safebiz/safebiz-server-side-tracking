@@ -2,6 +2,17 @@
 
 Toate modificările notabile la `safebiz-server-side-tracking` sunt documentate aici. Format conform [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versionare conform [SemVer](https://semver.org/lang/ro/).
 
+## [1.3.3] - 2026-08-23
+
+### Fixed
+
+- **Detecția codului de produs cădea pe SKU când GTM Kit nu avea setarea salvată** — exact dezacordul browser ↔ server pe care 1.3.1 trebuia să-l elimine.
+  GTM Kit citește setarea cu `if ( $this->options->get('integrations', 'woocommerce_use_sku') )` (`src/Integration/WooCommerce.php`), deci pentru el **cheie lipsă = fals = ID numeric**. Noi tratam lipsa drept „nu știu" și cădeam pe SKU.
+  Măsurat pe boltom.ro (2026-08-23): GTM Kit activ, cheia inexistentă în opțiune, browserul trimitea `item_id: "6338"` (ID numeric), serverul trimitea SKU, pe un magazin cu 397 de SKU-uri reale ⇒ același produs ajungea în GA4 sub două identități.
+  **Acum oglindim GTM Kit inclusiv implicitul lui** (`! empty()` în loc de `isset()`).
+  ⚠️ Alinierea se aplică **doar** când integrarea WooCommerce a GTM Kit e pornită (`woocommerce_integration`) — altfel nu există dataLayer de comerț cu care să ne aliniem, iar site-ul păstrează comportamentul istoric (SKU).
+  ⚠️ Site-urile **fără** GTM Kit: neschimbate. Site-urile cu `woocommerce_use_sku` setat explicit: neschimbate. Constanta `SAFEBIZ_GA4_ITEM_ID_USE_SKU` bate în continuare orice.
+
 ## [1.3.2] - 2026-08-23
 
 ### Added

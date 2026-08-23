@@ -3,7 +3,7 @@
  * Plugin Name: SafeBiz Server-Side Tracking
  * Plugin URI: https://github.com/safebiz/safebiz-server-side-tracking
  * Description: Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub.
- * Version: 1.3.2
+ * Version: 1.3.3
  * Author: SafeBiz Solutions
  * Author URI: https://safebiz.ro
  * License: GPL-2.0-or-later
@@ -453,10 +453,24 @@ function safebiz_build_purchase_params($order) {
  */
 function safebiz_ga4_item_id_use_sku() {
     if ( defined('SAFEBIZ_GA4_ITEM_ID_USE_SKU') ) return (bool) SAFEBIZ_GA4_ITEM_ID_USE_SKU;
+
     $gtmkit = get_option('gtmkit');
-    if ( is_array($gtmkit) && isset($gtmkit['integrations']['woocommerce_use_sku']) ) {
-        return (bool) $gtmkit['integrations']['woocommerce_use_sku'];
+    // OGLINDIM GTM Kit, INCLUSIV IMPLICITUL LUI.
+    // GTM Kit citeste setarea cu `if ( $this->options->get('integrations', 'woocommerce_use_sku') )`
+    // (src/Integration/WooCommerce.php) => pentru el cheia LIPSA sau goala inseamna FALS, adica ID numeric.
+    // Daca noi am trata lipsa drept "nu stiu" si am cadea pe SKU, am produce exact dezacordul
+    // browser <-> server pe care regula asta trebuie sa-l elimine.
+    // Masurat pe boltom.ro (2026-08-23): GTM Kit activ, cheia `woocommerce_use_sku` inexistenta in
+    // optiune, browserul trimitea `item_id: "6338"` (ID numeric) iar serverul SKU, pe un magazin cu
+    // 397 de SKU-uri reale => acelasi produs ajungea in GA4 sub doua identitati.
+    // Conditia pe `woocommerce_integration`: doar cand integrarea WooCommerce a GTM Kit e PORNITA
+    // exista un dataLayer de comert cu care sa ne aliniem. Daca e oprita, nu avem cu ce sa ne aliniem
+    // si pastram comportamentul istoric, ca sa nu schimbam tacit raportarea unui site.
+    if ( is_array($gtmkit) && ! empty($gtmkit['integrations']['woocommerce_integration']) ) {
+        return ! empty($gtmkit['integrations']['woocommerce_use_sku']);
     }
+
+    // Fara GTM Kit (sau cu integrarea WooCommerce oprita): comportamentul istoric — SKU.
     return true;
 }
 
