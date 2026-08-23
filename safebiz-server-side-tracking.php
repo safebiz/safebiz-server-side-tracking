@@ -3,7 +3,7 @@
  * Plugin Name: SafeBiz Server-Side Tracking
  * Plugin URI: https://github.com/safebiz/safebiz-server-side-tracking
  * Description: Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub.
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: SafeBiz Solutions
  * Author URI: https://safebiz.ro
  * License: GPL-2.0-or-later
@@ -405,6 +405,9 @@ function safebiz_send_ga4_purchase($order_id) {
             $order->update_meta_data('_safebiz_ga4_mp_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
         }
     }
+
+    // Copie catre proprietatea GA4 secundara (implicit: doar `refund`). Nu atinge statusul de mai sus.
+    safebiz_ga4_send_secondary($order, 'purchase', $payload);
     $order->save();
 }
 
@@ -482,6 +485,90 @@ function safebiz_ga4_build_items($order) {
 function safebiz_get_client_id($order) {
     $client_id = $order->get_meta('_ga_client_id');
     return ! empty($client_id) ? $client_id : wp_hash('order_' . $order->get_order_number());
+}
+
+// ============================================================
+// PROPRIETATE GA4 SECUNDARA (optionala)
+// ============================================================
+/**
+ * A doua proprietate GA4 catre care se trimite acelasi eveniment.
+ *
+ * DE CE EXISTA: pe monitorstup exista o a doua proprietate ("Premium sGTM") care primeste
+ * DOAR ce trimite browserul. Restituirile nu exista in browser — se intampla in administrare,
+ * ore sau zile mai tarziu — deci proprietatea aceea nu putea vedea NICIODATA o anulare.
+ *
+ * Constante in wp-config.php:
+ *   SAFEBIZ_GA4_MEASUREMENT_ID_2 / SAFEBIZ_GA4_API_SECRET_2  — proprietatea secundara
+ *   SAFEBIZ_GA4_SECONDARY_EVENTS — 'refund' (implicit) | 'all' | 'off'
+ *
+ * IMPLICIT 'refund', DELIBERAT: `purchase` ajunge deja pe proprietatea secundara din browser.
+ * Daca l-ar trimite si serverul, riscam numararea dubla — GA4 nu garanteaza deduplicarea dupa
+ * `transaction_id`. Treci pe 'all' DOAR dupa ce ai masurat ca proprietatea principala arata
+ * o singura cumparare pentru o comanda trimisa si din browser, si de la server.
+ */
+function safebiz_ga4_secondary_config() {
+    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID_2') || ! defined('SAFEBIZ_GA4_API_SECRET_2') ) return null;
+    $id     = trim( (string) SAFEBIZ_GA4_MEASUREMENT_ID_2 );
+    $secret = trim( (string) SAFEBIZ_GA4_API_SECRET_2 );
+    if ( '' === $id || '' === $secret ) return null;
+    // Garda: aceeasi proprietate ca principala ar insemna doua trimiteri catre acelasi loc.
+    if ( defined('SAFEBIZ_GA4_MEASUREMENT_ID') && $id === trim( (string) SAFEBIZ_GA4_MEASUREMENT_ID ) ) return null;
+    return ['id' => $id, 'secret' => $secret];
+}
+
+function safebiz_ga4_secondary_scope() {
+    $s = defined('SAFEBIZ_GA4_SECONDARY_EVENTS')
+        ? strtolower( trim( (string) SAFEBIZ_GA4_SECONDARY_EVENTS ) )
+        : 'refund';
+    return in_array($s, ['off', 'refund', 'all'], true) ? $s : 'refund';
+}
+
+/**
+ * Trimite ACELASI payload si catre proprietatea secundara.
+ *
+ * Separata intentionat de calea principala: proprietatea secundara e o copie a masurarii,
+ * nu sursa de adevar. Orice esec aici se noteaza in meta proprii (`..._2`), dar NU atinge
+ * statusul caii principale — altfel un timeout pe secundara ar bloca sau ar relua principala.
+ *
+ * Idempotenta: acelasi tipar ca la principala — flag durabil per eveniment, iar ORICE raspuns
+ * primit e TERMINAL (MP e fire-and-accept; o reluare ar dubla evenimentul).
+ *
+ * NU salveaza comanda — apelantul face $order->save() imediat dupa.
+ */
+function safebiz_ga4_send_secondary($order, $event_name, $payload) {
+    $cfg = safebiz_ga4_secondary_config();
+    if ( ! $cfg ) return;
+    $scope = safebiz_ga4_secondary_scope();
+    if ( 'off' === $scope ) return;
+    if ( 'refund' === $scope && 'refund' !== $event_name ) return;
+
+    $flag = '_safebiz_ga4_' . $event_name . '_sent_2';
+    $stat = '_safebiz_ga4_' . $event_name . '_status_2';
+    $err  = '_safebiz_ga4_' . $event_name . '_error_2';
+    if ( '1' === $order->get_meta($flag) ) return;
+    if ( in_array( (string) $order->get_meta($stat), ['error_http', 'error_ambiguous'], true ) ) return;
+
+    $url = sprintf('https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
+        urlencode($cfg['id']), urlencode($cfg['secret']));
+    $response = wp_remote_post($url, [
+        'headers' => ['Content-Type' => 'application/json'],
+        'body'    => wp_json_encode($payload), 'timeout' => 10, 'blocking' => true,
+    ]);
+
+    if ( is_wp_error($response) ) {
+        $order->update_meta_data($stat, 'error_ambiguous');
+        $order->update_meta_data($err, substr($response->get_error_message(), 0, 200));
+        return;
+    }
+    $code = (int) wp_remote_retrieve_response_code($response);
+    if ( $code >= 200 && $code < 300 ) {
+        $order->update_meta_data($flag, '1');
+        $order->update_meta_data($stat, 'sent');
+        $order->update_meta_data('_safebiz_ga4_' . $event_name . '_at_2', current_time('mysql'));
+    } else {
+        $order->update_meta_data($stat, 'error_http');
+        $order->update_meta_data($err, 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
+    }
 }
 
 // ============================================================
@@ -723,6 +810,9 @@ function safebiz_send_ga4_refund($order_id) {
             $order->update_meta_data('_safebiz_ga4_refund_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
         }
     }
+
+    // Copie catre proprietatea GA4 secundara (implicit: doar `refund`). Nu atinge statusul de mai sus.
+    safebiz_ga4_send_secondary($order, 'refund', $payload);
     $order->save();
 }
 

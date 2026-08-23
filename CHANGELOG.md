@@ -2,6 +2,20 @@
 
 Toate modificările notabile la `safebiz-server-side-tracking` sunt documentate aici. Format conform [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versionare conform [SemVer](https://semver.org/lang/ro/).
 
+## [1.3.2] - 2026-08-23
+
+### Added
+
+- **Proprietate GA4 secundară, opțională.** Un site poate avea două proprietăți GA4: una alimentată din browser + server, alta doar din browser (tiparul „Premium sGTM" de pe monitorstup). Restituirile nu există în browser — se întâmplă în administrare, ore sau zile mai târziu — deci proprietatea a doua **nu putea vedea niciodată o anulare**.
+  Constante noi în `wp-config.php`: `SAFEBIZ_GA4_MEASUREMENT_ID_2` / `SAFEBIZ_GA4_API_SECRET_2`, plus `SAFEBIZ_GA4_SECONDARY_EVENTS` = `refund` (implicit) | `all` | `off`.
+  ⚠️ **Implicit doar `refund`, deliberat.** `purchase` ajunge deja pe proprietatea secundară din browser; dacă l-ar trimite și serverul, riscăm numărare dublă — GA4 **nu** garantează deduplicarea după `transaction_id`. Treci pe `all` doar după ce ai măsurat că proprietatea principală arată **o singură** cumpărare pentru o comandă trimisă și din browser, și de la server.
+  ⚠️ Gardă: dacă măsurarea secundară e identică cu cea principală, trimiterea se sare — altfel același eveniment ar pleca de două ori spre același loc.
+- Stări proprii pentru calea secundară (`_safebiz_ga4_{purchase,refund}_status_2`, `..._sent_2`, `..._error_2`, `..._at_2`). Un eșec pe secundară **nu** atinge starea căii principale: altfel un timeout pe copie ar bloca sau ar relua originalul. Idempotență identică cu principala — orice răspuns primit e terminal.
+
+### Unchanged
+
+- Site-urile fără constantele `_2` se comportă exact ca în 1.3.1. Nicio schimbare de payload, de consimțământ sau de cron.
+
 ## [1.3.1] - 2026-08-23
 
 ### Fixed
