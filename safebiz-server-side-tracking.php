@@ -3,7 +3,7 @@
  * Plugin Name: SafeBiz Server-Side Tracking
  * Plugin URI: https://github.com/safebiz/safebiz-server-side-tracking
  * Description: Server-side purchase tracking GA4 (Measurement Protocol) + Meta Conversions API, gate pe consimtamant, session_id join (atribuire sursa corecta), async via Action Scheduler, retry + logging + auto-update GitHub.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: SafeBiz Solutions
  * Author URI: https://safebiz.ro
  * License: GPL-2.0-or-later
@@ -427,20 +427,56 @@ function safebiz_build_purchase_params($order) {
     }
 
     if ( defined('SAFEBIZ_GA4_SEND_ITEMS') && SAFEBIZ_GA4_SEND_ITEMS === true ) {
-        $items = [];
-        foreach ( $order->get_items('line_item') as $item ) {
-            $product = $item->get_product();
-            $sku = $product && $product->get_sku() ? $product->get_sku() : (string) $item->get_product_id();
-            $items[] = [
-                'item_id'   => $sku,
-                'item_name' => $item->get_name(),
-                'price'     => (float) wc_format_decimal($order->get_item_total($item, false, true), 2),
-                'quantity'  => (int) $item->get_quantity(),
-            ];
-        }
-        $params['items'] = $items;
+        $params['items'] = safebiz_ga4_build_items($order);
     }
     return $params;
+}
+
+/**
+ * v1.3.1 — Sursa pentru `item_id`, ALINIATA cu ce trimite browserul.
+ *
+ * DE CE: daca browserul trimite SKU (`MS200`) si serverul ID numeric (`51766`), GA4 primeste
+ * aceeasi tranzactie cu doua coduri diferite, iar deduplicarea pe `transaction_id` pastreaza
+ * una dintre ele — nedefinit care. Raportarea pe produs devine impredictibila.
+ * (monitorstup, 2026-08-23: browserul a fost mutat pe ID numeric, serverul ramasese pe SKU.)
+ *
+ * REGULA, in ordine:
+ *   1. constanta `SAFEBIZ_GA4_ITEM_ID_USE_SKU` (override explicit per site)
+ *   2. setarea GTM Kit `integrations.woocommerce_use_sku` — sursa de adevar cand pluginul exista,
+ *      pentru ca ea decide ce pune browserul in dataLayer
+ *   3. `true` — comportamentul istoric, ca site-urile fara GTM Kit sa nu-si rupa raportarea
+ *
+ * @return bool true = trimite SKU, false = trimite ID numeric de produs.
+ */
+function safebiz_ga4_item_id_use_sku() {
+    if ( defined('SAFEBIZ_GA4_ITEM_ID_USE_SKU') ) return (bool) SAFEBIZ_GA4_ITEM_ID_USE_SKU;
+    $gtmkit = get_option('gtmkit');
+    if ( is_array($gtmkit) && isset($gtmkit['integrations']['woocommerce_use_sku']) ) {
+        return (bool) $gtmkit['integrations']['woocommerce_use_sku'];
+    }
+    return true;
+}
+
+/**
+ * v1.3.1 — Constructor unic de `items`, folosit si la purchase si la refund.
+ * Inainte, refund-ul nu trimitea deloc items => zero metrici de restituire pe produs in GA4.
+ */
+function safebiz_ga4_build_items($order) {
+    $use_sku = safebiz_ga4_item_id_use_sku();
+    $items   = [];
+    foreach ( $order->get_items('line_item') as $item ) {
+        $product = $item->get_product();
+        $item_id = ( $use_sku && $product && $product->get_sku() )
+            ? $product->get_sku()
+            : (string) $item->get_product_id();
+        $items[] = [
+            'item_id'   => $item_id,
+            'item_name' => $item->get_name(),
+            'price'     => (float) wc_format_decimal($order->get_item_total($item, false, true), 2),
+            'quantity'  => (int) $item->get_quantity(),
+        ];
+    }
+    return $items;
 }
 
 function safebiz_get_client_id($order) {
@@ -597,27 +633,73 @@ function safebiz_meta_custom_data($order) {
 }
 
 // ============================================================
-// Refund event GA4 (neschimbat — Meta refund out of scope v1.1.0)
+// Refund event GA4 — anulare / rambursare (v1.3.1: items + status + retry)
+// NOTA: Meta NU are eveniment standard de refund si o vanzare trimisa NU se poate anula
+// (verificat pe referinta oficiala Pixel, 2026-08-23: 17 evenimente standard, niciunul de refund).
+// Deci ROAS-ul raportat de Meta include mereu comenzile anulate; corectia se face din WooCommerce.
 // ============================================================
 add_action('woocommerce_order_status_refunded',  'safebiz_ga4_refund_event', 10, 1);
 add_action('woocommerce_order_status_cancelled', 'safebiz_ga4_refund_event', 10, 1);
 
 function safebiz_ga4_refund_event($order_id) {
+    // Guard OBLIGATORIU aici, nu doar in handler: fara el, pe un site fara GA4 configurat
+    // comanda ar ramane vesnic 'queued', iar cronul orar ar relua la infinit un job care
+    // iese imediat. (prins la review inainte de commit, 2026-08-23)
     if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) return;
     $order = wc_get_order($order_id);
     if ( ! $order ) return;
+    // Nu exista ce restitui daca vanzarea n-a plecat niciodata catre GA4.
+    if ( $order->get_meta('_safebiz_ga4_mp_status') !== 'sent' ) {
+        $order->update_meta_data('_safebiz_ga4_refund_status', 'skipped_no_purchase');
+        $order->save();
+        return;
+    }
+    if ( $order->get_meta('_safebiz_ga4_refund_sent') === '1' ) return; // guard terminal durabil
+    $st = (string) $order->get_meta('_safebiz_ga4_refund_status');
+    if ( in_array($st, ['queued', 'error_http', 'error_ambiguous'], true) ) return;
+
+    $order->update_meta_data('_safebiz_ga4_refund_status', 'queued');
+    $order->update_meta_data('_safebiz_ga4_refund_queued_at', current_time('mysql'));
+    $order->save();
+
+    $res = safebiz_dispatch_job('safebiz_send_ga4_refund', $order_id);
+    if ( 0 === $res ) { // enqueue esuat -> zero POST, sigur de reluat
+        $order->update_meta_data('_safebiz_ga4_refund_status', 'error_enqueue');
+        $order->save();
+    }
+}
+
+add_action('safebiz_send_ga4_refund', 'safebiz_send_ga4_refund', 10, 1);
+
+function safebiz_send_ga4_refund($order_id) {
+    if ( ! defined('SAFEBIZ_GA4_MEASUREMENT_ID') || ! defined('SAFEBIZ_GA4_API_SECRET') ) return;
+    $order = wc_get_order($order_id);
+    if ( ! $order ) return;
+    if ( $order->get_meta('_safebiz_ga4_refund_sent') === '1' ) return; // guard terminal durabil
     if ( $order->get_meta('_safebiz_ga4_mp_status') !== 'sent' ) return;
-    if ( $order->get_meta('_safebiz_ga4_refund_sent') === '1' ) return;
 
     $marketing = safebiz_consent_val($order->get_meta('_safebiz_consent_state'), 'marketing');
+    $params = [
+        'transaction_id' => (string) $order->get_order_number(),
+        'value'          => (float) wc_format_decimal($order->get_total(), 2),
+        'currency'       => $order->get_currency(),
+        'tax'            => (float) wc_format_decimal($order->get_total_tax(), 2),
+        'shipping'       => (float) wc_format_decimal($order->get_shipping_total(), 2),
+    ];
+    // v1.3.1: items in refund -> GA4 arata restituirea si la nivel de produs, nu doar ca suma.
+    if ( defined('SAFEBIZ_GA4_SEND_ITEMS') && SAFEBIZ_GA4_SEND_ITEMS === true ) {
+        $params['items'] = safebiz_ga4_build_items($order);
+    }
+    $session_id = $order->get_meta('_ga_session_id');
+    if ( ! empty($session_id) ) {
+        $params['session_id']           = $session_id;
+        $params['engagement_time_msec'] = 1;
+    }
+
     $payload = [
         'client_id' => safebiz_get_client_id($order),
         'consent'   => ['ad_user_data' => $marketing, 'ad_personalization' => $marketing],
-        'events'    => [[ 'name' => 'refund', 'params' => [
-            'transaction_id' => (string) $order->get_order_number(),
-            'value'          => (float) wc_format_decimal($order->get_total(), 2),
-            'currency'       => $order->get_currency(),
-        ]]],
+        'events'    => [[ 'name' => 'refund', 'params' => $params ]],
     ];
     $url = sprintf('https://region1.google-analytics.com/mp/collect?measurement_id=%s&api_secret=%s',
         urlencode(SAFEBIZ_GA4_MEASUREMENT_ID), urlencode(SAFEBIZ_GA4_API_SECRET));
@@ -625,11 +707,23 @@ function safebiz_ga4_refund_event($order_id) {
         'headers' => ['Content-Type' => 'application/json'],
         'body'    => wp_json_encode($payload), 'timeout' => 10, 'blocking' => true,
     ]);
-    if ( ! is_wp_error($response) && wp_remote_retrieve_response_code($response) === 204 ) {
-        $order->update_meta_data('_safebiz_ga4_refund_sent', '1');
-        $order->update_meta_data('_safebiz_ga4_refund_at', current_time('mysql'));
-        $order->save();
+
+    if ( is_wp_error($response) ) {
+        // Fara raspuns: POST-ul poate a ajuns. TERMINAL, ca la purchase — o reluare ar dubla restituirea.
+        $order->update_meta_data('_safebiz_ga4_refund_status', 'error_ambiguous');
+        $order->update_meta_data('_safebiz_ga4_refund_error', substr($response->get_error_message(), 0, 200));
+    } else {
+        $code = (int) wp_remote_retrieve_response_code($response);
+        if ( 204 === $code ) {
+            $order->update_meta_data('_safebiz_ga4_refund_sent', '1');
+            $order->update_meta_data('_safebiz_ga4_refund_status', 'sent');
+            $order->update_meta_data('_safebiz_ga4_refund_at', current_time('mysql'));
+        } else {
+            $order->update_meta_data('_safebiz_ga4_refund_status', 'error_http');
+            $order->update_meta_data('_safebiz_ga4_refund_error', 'HTTP ' . $code . ' ' . substr(wp_remote_retrieve_body($response), 0, 200));
+        }
     }
+    $order->save();
 }
 
 // ============================================================
@@ -642,6 +736,7 @@ add_action('init', function() {
     if ( ! function_exists('wc_get_orders') ) {
         wp_clear_scheduled_hook('safebiz_ga4_retry_errors');
         wp_clear_scheduled_hook('safebiz_meta_capi_retry_errors');
+        wp_clear_scheduled_hook('safebiz_ga4_refund_retry_errors');
         return;
     }
     if ( ! wp_next_scheduled('safebiz_ga4_retry_errors') ) {
@@ -649,6 +744,9 @@ add_action('init', function() {
     }
     if ( ! wp_next_scheduled('safebiz_meta_capi_retry_errors') ) {
         wp_schedule_event(time(), 'hourly', 'safebiz_meta_capi_retry_errors');
+    }
+    if ( ! wp_next_scheduled('safebiz_ga4_refund_retry_errors') ) {
+        wp_schedule_event(time(), 'hourly', 'safebiz_ga4_refund_retry_errors');
     }
 });
 
@@ -697,6 +795,35 @@ add_action('safebiz_meta_capi_retry_errors', function() {
     foreach ( $orders as $order ) {
         if ( safebiz_meta_purchase_is_terminal($order) ) continue;
         safebiz_send_meta_purchase($order->get_id());
+    }
+});
+
+// v1.3.1 — retry pentru RESTITUIRE (anulare / rambursare).
+// Aceeasi regula de siguranta ca la purchase: se reia DOAR ce sigur n-a ajuns la Google.
+//   - error_enqueue: jobul nu a pornit (zero POST)
+//   - queued blocat > 2h: jobul nu a rulat niciodata (zero POST)
+// NU se reia error_http / error_ambiguous — POST-ul poate a ajuns, iar o a doua restituire
+// ar scadea venitul de doua ori.
+// ATENTIE la statusul comenzii: o restituire traieste pe 'cancelled'/'refunded', NU pe
+// 'processing'/'completed' ca purchase-ul — de aceea interogarea e separata.
+add_action('safebiz_ga4_refund_retry_errors', function() {
+    if ( ! function_exists('wc_get_orders') ) return;
+    $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - 2 * HOUR_IN_SECONDS);
+    $orders = wc_get_orders([
+        'limit'  => 20, 'status' => ['wc-cancelled', 'wc-refunded'],
+        'meta_query' => [
+            'relation' => 'OR',
+            [ 'key' => '_safebiz_ga4_refund_status', 'value' => 'error_enqueue' ],
+            [
+                'relation' => 'AND',
+                [ 'key' => '_safebiz_ga4_refund_status',    'value' => 'queued' ],
+                [ 'key' => '_safebiz_ga4_refund_queued_at', 'value' => $cutoff, 'compare' => '<' ],
+            ],
+        ],
+    ]);
+    foreach ( $orders as $order ) {
+        if ( $order->get_meta('_safebiz_ga4_refund_sent') === '1' ) continue; // bariera de cod
+        safebiz_send_ga4_refund($order->get_id());
     }
 });
 

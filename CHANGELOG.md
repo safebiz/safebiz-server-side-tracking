@@ -2,6 +2,27 @@
 
 Toate modificările notabile la `safebiz-server-side-tracking` sunt documentate aici. Format conform [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versionare conform [SemVer](https://semver.org/lang/ro/).
 
+## [1.3.1] - 2026-08-23
+
+### Fixed
+
+- **GA4 primea aceeași tranzacție cu două coduri de produs diferite.** Browserul (prin GTM Kit) putea trimite ID numeric iar serverul SKU pentru aceeași comandă; GA4 deduplică pe `transaction_id` și păstrează una dintre variante — nedefinit care ⇒ raportarea pe produs devenea impredictibilă. Descoperit pe monitorstup (2026-08-23), după ce `woocommerce_use_sku` a fost oprit în GTM Kit iar serverul a rămas pe SKU.
+  **Regula nouă (`safebiz_ga4_item_id_use_sku()`), în ordine:** constanta `SAFEBIZ_GA4_ITEM_ID_USE_SKU` → setarea GTM Kit `integrations.woocommerce_use_sku` → `true` (comportamentul istoric).
+  ⚠️ Site-urile **fără** GTM Kit și fără constantă păstrează exact comportamentul vechi — actualizarea nu rupe raportarea nimănui.
+
+### Added
+
+- **`items` în evenimentul `refund`.** Până acum restituirea trimitea doar suma ⇒ GA4 nu putea arăta ce produs s-a anulat. Constructor unic `safebiz_ga4_build_items()`, folosit și la `purchase` și la `refund`. Se adaugă și `tax`, `shipping` și `session_id`, ca la purchase.
+- **Retry pentru restituire.** Înainte, restituirea se trimitea sincron, o singură dată; o eroare de rețea o pierdea definitiv, fără urmă. Acum urmează exact modelul de la purchase: `_safebiz_ga4_refund_status` (`queued` | `sent` | `error_enqueue` | `error_http` | `error_ambiguous` | `skipped_no_purchase`), dispatch prin Action Scheduler și cron orar `safebiz_ga4_refund_retry_errors`.
+  ⚠️ **Se reia DOAR ce sigur n-a ajuns** (`error_enqueue`, sau `queued` blocat > 2h). `error_http` și `error_ambiguous` rămân terminale — o a doua restituire ar scădea venitul de două ori.
+  ⚠️ Interogarea cronului folosește stările `wc-cancelled` / `wc-refunded`, nu `wc-processing` / `wc-completed` ca la purchase.
+- Guard terminal durabil păstrat pe `_safebiz_ga4_refund_sent`, compatibil cu comenzile deja restituite înainte de 1.3.1.
+
+### Notes
+
+- **Meta NU are eveniment standard de restituire și o vânzare deja trimisă NU se poate anula, șterge sau scădea** (verificat pe referința oficială Meta Pixel, 2026-08-23: 17 evenimente standard, niciunul pentru refund/cancel/return; „Cancellation and Refund API" e pentru comenzile din magazinul Facebook/Instagram, nu pentru conversii de pe site). Consecință: randamentul raportat de Meta include mereu comenzile anulate — corecția se face din WooCommerce, nu din Meta. Decizie taki 2026-08-23: **nu** trimitem eveniment personalizat de anulare.
+- Restituirea pleacă doar către `SAFEBIZ_GA4_MEASUREMENT_ID` (o singură proprietate). Pe monitorstup, proprietatea Premium nu are secret Measurement Protocol ⇒ nu primește nici purchase, nici refund de pe server. Rămâne deschis.
+
 ## [1.3.0] - 2026-07-14
 
 ### Fixed
